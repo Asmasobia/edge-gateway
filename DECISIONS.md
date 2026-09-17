@@ -652,3 +652,294 @@ buckets — from leaving half the state behind. An invariant nothing checks is a
 **Cost accepted.** One test reaches into private attributes and will need updating if the
 representation changes. That is the correct coupling: the test exists precisely to catch a
 representation change that forgets part of the reset.
+---
+
+## ADR-025 — The bulkhead is a separate component from the deadline, not a setting on it
+
+**Status:** accepted (slice 3)
+
+**Context.** Both components exist to stop a slow dependency from hurting us, and both are configured
+per dependency, so the obvious simplification is to fold concurrency limiting into the timeout budget:
+one object, one config block, one thing to explain.
+
+**Decision.** Keep them separate. `Deadline` bounds how long *one* call may run. `Bulkhead` bounds how
+many calls may run *at once*. Neither can be expressed in terms of the other.
+
+**Why.** The two limits answer different questions, and the failure that motivates the bulkhead happens
+while every deadline is being honoured perfectly. Search degrades from 50 ms to 30 s. Every call still
+finishes inside its 30 s budget — nothing has timed out, no deadline was violated, the timeout code has
+no bug. But each of those calls now occupies a worker for 600× longer than it used to, so within a
+minute every worker in the process is parked inside a search call. Payments traffic, which is healthy
+and fast and has nothing to do with search, queues behind it and times out. "Each call is limited to
+30 s" and "all capacity is held by search" are entirely compatible statements; that is the whole point.
+
+The reverse also holds: a bulkhead without deadlines is a pool that fills up and never drains, because
+nothing forces a call to end. They compose (slice 4) precisely because neither subsumes the other.
+
+**Cost accepted.** Two objects and two config blocks per dependency instead of one, and a reader who
+has to understand why. The alternative is one object with a name that lies about what it does.
+
+---
+
+## ADR-026 — The queue is bounded, small, and full means fail immediately
+
+**Status:** accepted (slice 3)
+
+**Context.** Bounded concurrency alone is one line: `asyncio.Semaphore(max_concurrent)`. Callers past
+the limit wait, and the semaphore's waiter list is unbounded, so nobody is ever turned away.
+
+**Decision.** A bounded queue of configurable depth `max_queue`, and `BulkheadFullError` raised
+synchronously — before any suspension point — once both the pool and the queue are full. `max_queue=0`
+is legal and means pure fast failure.
+
+**Why.** An unbounded waiter list does not remove the dependency's backlog, it *relocates* it into this
+process. The queue costs memory, holds a client connection open per entry, and grows latency without
+growing throughput — throughput is set by the dependency's capacity, not by how many callers are
+hopeful. A queue is only good at one thing: absorbing a burst the pool will drain shortly.
+
+Sizing is arithmetic, not taste. With per-call latency `L` and concurrency `C`, the pool completes
+`C / L` calls per second, so the last entrant to a queue of depth `Q` waits roughly `Q * L / C`. At
+L = 50 ms, C = 20, Q = 100 that is 250 ms of pure queueing on top of the call itself. Choose `Q` from
+the queueing latency you are willing to add; if the answer is "none", `max_queue=0` says so exactly.
+
+Two consequences worth stating plainly. First, **a rejection is not an outage.** `BulkheadFullError`
+during a spike is the component doing its job — shedding load so the requests that are served are
+served properly. Alert on the rejection *rate*, not on individual occurrences. Second, **a rejection is
+never evidence against the dependency**: the call was not made, so nothing was learnt about its health.
+Slice 4 classifies it as not-counted for exactly this reason; a queue sized slightly too small must not
+be able to trip a circuit breaker on a service that is perfectly healthy.
+
+`max_concurrent` is deliberately allowed to over-subscribe: each dependency's share must be smaller than
+the process's total capacity, but the *sum* of the shares may exceed it. Sizing the shares to add up
+exactly leaves capacity idle whenever any dependency is quiet, which is most of the time.
+
+**Cost accepted.** Callers must handle a new error, and a mis-sized queue sheds load that a larger one
+would have served. That is the trade being made on purpose: bounded harm instead of unbounded latency.
+
+---
+
+## ADR-027 — `acquire()` takes no timeout parameter
+
+**Status:** accepted (slice 3)
+
+**Context.** "Wait for a slot, but not forever" is a real requirement, and a `timeout=` argument on
+`acquire()` is the conventional way to spell it.
+
+**Decision.** No timeout parameter. Callers who need one wrap the call: `async with
+asyncio.timeout(budget): slot = await bulkhead.acquire()`.
+
+**Why.** `asyncio.timeout` already composes with any awaitable, and a caller holding a `Deadline`
+(ADR-005) already knows its remaining budget — so the parameter would add a second, independent
+abandonment mechanism with no new capability. It would also make attribution ambiguous: with two ways
+to give up, "who abandoned this call, and against which budget" stops being answerable from the
+metrics, and abandonment attribution is the thing the deadline work exists to make clear.
+
+The consequence is that **cancellation is the mechanism**, not an edge case — which is precisely why
+cancellation-safety (ADR-028) is not optional here.
+
+**Cost accepted.** Two lines at the call site instead of one argument, and a caller who forgets the
+wrapper waits as long as the queue makes them. The queue is bounded and small, so that wait is bounded
+by construction.
+
+---
+
+## ADR-028 — Cancellation is handled at two distinct moments, and a granted slot is passed on
+
+**Status:** accepted (slice 3)
+
+**Context.** With cancellation as the abandonment mechanism, a caller can vanish mid-operation. There
+are two moments at which that can happen, and they need opposite responses.
+
+**Decision.**
+
+1. **Cancelled while queued** — remove the waiter from the queue (`_discard_waiter`), count
+   `cancelled_while_queued`, re-raise.
+2. **Cancelled after a slot was granted but before resuming** — the slot is already promised to this
+   waiter, so hand it on to the next waiter (`_release_or_hand_over`), count `cancelled_at_handover`,
+   re-raise.
+
+The cleanup is `except BaseException`, not `except asyncio.CancelledError`.
+
+**Why.** Case 1 left unhandled fills the queue with ghosts: entries belonging to callers that are long
+gone, occupying capacity and causing `BulkheadFullError` to be raised at live callers on behalf of dead
+ones.
+
+Case 2 is worse, because it is silent and permanent. A dropped slot is never recovered — `_in_flight`
+stays incremented for the lifetime of the process. After `max_concurrent` such events the bulkhead
+rejects everything while reporting itself completely full, with nothing in the logs and no failing
+dependency to blame. This is the same failure class as an unresolved `Permit` in the breaker (ADR-019):
+*a resource whose release depends on control returning to code that may never run.* Recognising the
+class is what makes it findable in review; the fix is always the same shape — release in a handler that
+runs even when the happy path does not.
+
+`BaseException` rather than `CancelledError` because `coroutine.close()` throws `GeneratorExit`. An
+abandoned coroutine — one that was started, suspended in the queue, and then dropped without ever being
+awaited — must not leave a ghost either, and a handler that only catches cancellation would let it.
+There is a test asserting exactly that, because it is the kind of thing no reviewer thinks to check.
+
+**Cost accepted.** The cleanup path is the most intricate code in the module, and its correctness is not
+apparent from reading it once. It is therefore the most heavily tested: the distinction in case 2 rests
+on `waiter.done() and not waiter.cancelled()`, and the mutation matrix confirms that breaking either
+moment is caught — by a hang, in the cases where the pool's capacity silently disappears.
+
+---
+
+## ADR-029 — A freed slot is handed directly to the head of the queue
+
+**Status:** accepted (slice 3)
+
+**Context.** On release, the alternative implementation is the obvious one: decrement `_in_flight`, then
+wake a waiter and let it re-run the same "is there capacity?" check that every caller runs.
+
+**Decision.** Direct handover. `_release_or_hand_over` passes the slot straight to the head of the
+queue and `_in_flight` never dips; only if the queue is empty is the count decremented.
+
+**Why.** Waking a waiter to re-check capacity opens a window. Between the decrement and the waiter
+actually resuming, `_in_flight` is below the limit, so a brand-new caller arriving in that window takes
+the fast path and walks off with capacity that was already promised to somebody who has been waiting.
+Under sustained load, that is not a rare interleaving — it is the normal one, and the queue starves
+while the newcomers are served.
+
+Because `_in_flight` never dips, there is no such instant, and FIFO fairness holds with no fairness
+mechanism at all: it falls out of the fact that spare capacity and a non-empty queue are mutually
+exclusive states. That property is what licenses the unguarded fast path in `acquire()`, and the comment
+there says so, because it looks like a race and is not.
+
+**Cost accepted.** `_in_flight` no longer means "calls currently executing" at every instant — during
+the one-tick handover window it counts a slot that is promised but not yet in use. That is the honest
+reading (the capacity genuinely is not available), and there is a test that pins the behaviour by
+advancing a newcomer's coroutine exactly one step into that window.
+
+---
+
+## ADR-030 — FIFO, not LIFO
+
+**Status:** accepted (slice 3)
+
+**Context.** A queue under overload has a real argument for serving the *newest* waiter first. The
+newest request is the one most likely to still have a client attached; the oldest has probably already
+been abandoned upstream, so serving it produces a response nobody reads. LIFO measurably improves
+goodput under sustained overload, and this is not a fringe position.
+
+**Decision.** FIFO — `collections.deque`, append at the tail, pop from the head.
+
+**Why.** LIFO's advantage appears only under *sustained* overload, which is the regime this design is
+built to avoid rather than optimise for: the queue is deliberately small (ADR-026), so a waiter cannot
+sit in it long enough to have gone stale. Meanwhile LIFO can starve an individual waiter indefinitely,
+and "your request waited 4 seconds while later ones were served" is a debugging experience nobody
+should have to reason about at 3am when the queue is 100 deep and the cause is invisible.
+
+FIFO also composes better with deadlines: a caller's budget is bounded and its position only improves,
+so its worst case is computable (`Q * L / C`, ADR-026) rather than unbounded.
+
+**Cost accepted.** Slightly worse goodput in a regime the sizing rules are meant to keep us out of. If
+that regime turns out to be routine, LIFO is a one-line change to `_hand_over_to_next_waiter` — and the
+right response would probably be a smaller queue rather than a different discipline.
+
+---
+
+## ADR-031 — `admitted` counts calls that got a usable slot, measured on resumption
+
+**Status:** accepted (slice 3)
+
+**Context.** A queued caller could be counted as admitted at the moment the slot is handed to it, which
+is where the state change happens and is one line shorter.
+
+**Decision.** Count on resumption, in `_wait_for_slot` after the `await` returns. A waiter granted a
+slot and then cancelled is *not* an admission; it is counted separately as `cancelled_at_handover`.
+
+**Why.** `admitted` exists to be divided by attempts, and to size the pool from real usage. Counting at
+handover inflates it with calls that never ran, and it does so *worst under overload* — cancellations at
+handover cluster exactly when clients are timing out. The metric would improve as the incident
+deepened, which is the most misleading shape a metric can have.
+
+Keeping `cancelled_at_handover` separate means nothing is hidden: the three outcomes of a queued call
+(admitted, cancelled while queued, cancelled at handover) are individually visible, and the third is
+also the tell for the silent capacity leak in ADR-028.
+
+**Cost accepted.** Three counters where one would nearly do. Mutation testing found that the resumption
+increment was originally unconstrained — every other assertion about `admitted` happened to use a
+queue-free configuration — so there is now a test that queues first and then checks the count.
+
+---
+
+## ADR-032 — `release()` is strict, `__exit__` is tolerant
+
+**Status:** accepted (slice 3)
+
+**Context.** `BulkheadSlot` can be released explicitly or by leaving a `with` block, so a caller who
+does both would release twice. One rule has to apply to each path, and they are not the same rule.
+
+**Decision.** `release()` raises `RuntimeError` if the slot is not held. `__exit__` releases only if the
+slot is still held, and is silent otherwise.
+
+**Why.** A double release returns capacity that was never taken, so the pool admits more concurrency
+than it is configured for — the exact failure the bulkhead exists to prevent, reached from the inside,
+silently, with the snapshot still reporting the configured limit. Nothing about that is recoverable by
+guessing, so it is an error and it is loud.
+
+`__exit__` has a different job: guarantee the slot comes back. Being strict there would turn the
+perfectly reasonable "release early, then leave the block" pattern into a crash *during unwinding* —
+and if the block is unwinding because of an exception, that crash would replace the real error with a
+bookkeeping complaint. The asymmetry is deliberate: strict where a mistake is a bug, tolerant where
+strictness would destroy information.
+
+**Cost accepted.** Two release paths with different strictness, which needs the comment it has. Both are
+tested, including the explicit-release-inside-the-block case that motivates the tolerance.
+
+---
+
+## ADR-033 — High-water marks are recorded alongside totals
+
+**Status:** accepted (slice 3)
+
+**Context.** `BulkheadSnapshot` could report only counters and let the metrics backend derive the rest,
+which is the usual division of labour.
+
+**Decision.** Also record `peak_in_flight`, `peak_queued` and `queue_wait_max_seconds` in-process, next
+to the totals they belong to.
+
+**Why.** Averages hide exactly the events these numbers exist to expose. Mean queue depth is
+approximately zero right up until the moment it is not, and a one-second shedding spike disappears
+completely into a per-minute average — so a scrape interval of 15 s or 60 s cannot see the thing that
+hurt. `peak_queued` is the number to size `max_queue` from, and it is only available to the process that
+observed it.
+
+`queue_wait_max_seconds` earns its place for a second reason: queue wait happens entirely *before* the
+outbound call, so it appears in no downstream metric and in no dependency's latency dashboard. Without
+it, a gateway that is itself the source of the latency looks innocent, and the investigation goes
+looking at the dependency. It is the number that distinguishes "the dependency is slow" from "we are the
+ones being slow."
+
+**Cost accepted.** Three more fields, and marks that only reset when the object does — a peak from an
+incident an hour ago still shows. For sizing decisions that is the desirable behaviour; a caller who
+wants windowed peaks can diff snapshots.
+
+---
+
+## ADR-034 — `asyncio_mode = "strict"`, superseding ADR-011's "deliberately absent"
+
+**Status:** accepted (slice 3), supersedes part of ADR-011
+
+**Context.** ADR-011 recorded that `pyproject.toml` set no `asyncio_mode` because there was no async
+code, and that adding the key would couple the suite to pytest-asyncio for no benefit. Slice 3 added the
+first async code — a bulkhead has to be able to wait — so the premise expired.
+
+**Decision.** Set `asyncio_mode = "strict"`: every async test carries `@pytest.mark.asyncio`.
+
+**Why.** `strict` over `auto` for the same reason `--strict-markers` is on. In `auto`, any coroutine
+test function runs on an event loop with no marker, which is convenient right up to the moment a *sync*
+test grows an `await`: it is silently reinterpreted rather than reported. Explicit costs one line per
+test and makes "this test needs an event loop" a visible property of the test rather than a property of
+the config file.
+
+The coupling ADR-011 worried about is real and is now accepted: `--strict-config` makes an unrecognised
+ini key a hard error, and `asyncio_mode` is only recognised while pytest-asyncio is installed — so a
+missing plugin fails collection for *every* test, not just the async ones. That is why the plugin is
+pinned in the `dev` extra rather than left to chance, and why the README's quick start installs that
+extra before running pytest. The `pythonpath` comment was corrected at the same time: the suite still
+never has to *build* this project, but it is no longer true that it needs nothing installed at all.
+
+**Cost accepted.** A marker on every async test, and a hard dependency on one pytest plugin. Recorded as
+a supersession rather than an edit to ADR-011, because the interesting part is not the current setting —
+it is that the decision was correct when made and stopped being correct when the code changed.

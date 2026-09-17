@@ -15,6 +15,12 @@ from edge_gateway.resilience.breaker import (
     Outcome,
     Permit,
 )
+from edge_gateway.resilience.bulkhead import (
+    Bulkhead,
+    BulkheadFullError,
+    BulkheadSlot,
+    BulkheadSnapshot,
+)
 from edge_gateway.resilience.clock import Clock, ManualClock, MonotonicClock
 from edge_gateway.resilience.deadline import (
     TIMEOUT_BUDGET_HEADER,
@@ -31,6 +37,10 @@ __all__ = [
     "BreakerSnapshot",
     "BreakerState",
     "BudgetSource",
+    "Bulkhead",
+    "BulkheadFullError",
+    "BulkheadSlot",
+    "BulkheadSnapshot",
     "CircuitBreaker",
     "CircuitOpenError",
     "Clock",

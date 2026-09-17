@@ -15,28 +15,33 @@ must not count as a dependency failure. A `timeout: 1s` line in a YAML file demo
 
 ## Status
 
-**Slices 1–2 of 4 complete: timeout budgets and circuit breaking.** The remaining slices are the
-bulkhead and the HTTP surface that composes all three.
+**Slices 1–3 of 4 complete: timeout budgets, circuit breaking and bulkheads.** The remaining slice is
+the HTTP surface that composes all three.
 
 | | Slice | State |
 |---|---|---|
 | 1 | Deadlines / timeout-budget propagation | ✅ done — 42 tests, 10/10 mutants killed |
 | 2 | Circuit breaker (sliding window, half-open with bounded trials) | ✅ done — 68 tests, 20/20 mutants killed |
-| 3 | Bulkhead (bounded concurrency + bounded queue) | ⬜ not started |
+| 3 | Bulkhead (bounded concurrency + bounded queue) | ✅ done — 32 tests, 22/22 mutants killed |
 | 4 | Composition + HTTP proxy, failure classification | ⬜ not started |
 
 ## Quick start
 
-Requires Python 3.12+. Nothing else — the resilience core has no runtime dependencies, so there is no
-install step, no service to start, and no network access needed.
+Requires Python 3.12+. The resilience core itself has no runtime dependencies — no service to start
+and no network access needed — so the only install is the test and lint toolchain.
 
 ```bash
 git clone <this repo> && cd edge-gateway
-python -m pytest                       # 110 tests, ~0.2s — none of them sleep
-python -m pip install -e ".[dev]"      # only needed for ruff / mypy
+python -m pip install -e ".[dev]"      # pytest, pytest-asyncio, ruff, mypy
+python -m pytest                       # 142 tests, ~0.3s — none of them sleep
 python -m ruff check . && python -m ruff format --check .
 python -m mypy --strict src tests
 ```
+
+`pytest-asyncio` is needed from slice 3 onward: the bulkhead is the first component that can wait, so
+the suite has async tests, and `pyproject.toml` sets `asyncio_mode = "strict"` (see ADR-034 for why
+`strict` and not `auto`). The project itself is still never *built* to run the tests — `pythonpath`
+points at `src/`, so the editable install above is for the tools, not to make imports work.
 
 ## The idea: budgets, not timeouts
 
@@ -203,12 +208,120 @@ failure, and the forcing is where breakers acquire their reputation for firing a
   exception, because it is not a policy decision about the dependency at all — it is an internal
   accuracy-versus-memory trade inside the window.
 
+## The idea: a bulkhead limits how *many*, and a deadline limits how *long*
+
+The name is from shipbuilding: a hull divided into sealed compartments, so a breach floods one
+compartment instead of the ship. Applied to a service, the compartments are shares of finite capacity —
+worker slots, connections, event-loop concurrency — one share per dependency.
+
+The failure it exists for is worth spelling out, because the interesting part is that **nothing else is
+broken when it happens.** Search degrades from 50 ms to 30 s. Every call still completes inside its 30 s
+budget: no deadline is violated, no timeout fires, the timeout code has no bug. But each call now
+occupies a worker 600× longer than it used to, so within a minute every worker in the process is parked
+inside a search call. Payments traffic — healthy, fast, unrelated — queues behind it and times out.
+
+"Each call is limited to 30 s" and "all capacity is held by search" are entirely compatible statements.
+That is the whole reason these are two components and not one setting: a deadline bounds the duration of
+one call and says nothing about how many calls hold capacity at once.
+
+```
+without a bulkhead                    with a bulkhead
+------------------                    ---------------
+search   ████████████████████ (all)   search   ████████░░░░░░░░░░░░ (capped at its share)
+payments ░░░░░░░░░░░░░░░░░░░░ (none)  payments ████░░░░░░░░░░░░░░░░ (served normally)
+```
+
+### Why the queue must be bounded, and small
+
+Bounded concurrency on its own is one line — `asyncio.Semaphore(n)` — and it is not enough, because a
+semaphore's waiter list is unlimited. That does not remove the dependency's backlog; it *relocates* it
+into this process, where it costs memory, holds a client connection open per entry, and grows latency
+without growing throughput. Throughput is set by the dependency's capacity, not by how many callers are
+hopeful. A queue is good at exactly one thing: absorbing a burst the pool will drain shortly.
+
+So the queue is bounded, and its depth is arithmetic rather than taste. With per-call latency `L` and
+concurrency `C`, the pool completes `C / L` calls per second, so the last entrant to a queue of depth `Q`
+waits about:
+
+```
+Q * L / C        e.g. 100 * 0.05 / 20 = 250ms of pure queueing, before the call even starts
+```
+
+Pick `Q` from the queueing latency you are willing to add. If the answer is "none", `max_queue=0` is
+legal and says so exactly. Two more sizing notes:
+
+- **`max_concurrent` must be smaller than the process's total capacity, but the *sum* across dependencies
+  is allowed to exceed it.** Sizing the shares so they add up exactly leaves capacity idle whenever a
+  dependency is quiet, which is most of the time. Deliberate over-subscription with each share capped is
+  the design, not an oversight.
+- **A rejection is not an outage.** `BulkheadFullError` during a spike is the component working: it sheds
+  load so that the requests which are served are served properly. Alert on the rejection *rate*, never on
+  individual occurrences. And a rejection is never evidence against the dependency — the call was not
+  made — which is why it is classified `NOT_COUNTED`. Otherwise a queue sized slightly too small could
+  trip a circuit breaker on a service that was healthy the entire time.
+
+### Why cancellation is the hard part
+
+`acquire()` has no `timeout` parameter. `asyncio.timeout` already composes with any awaitable, and a
+caller holding a `Deadline` already knows its remaining budget, so a second abandonment mechanism would
+add no capability and would make "who gave up, and against which budget" unanswerable from the metrics.
+
+That makes cancellation *the* mechanism rather than an edge case — and a caller can vanish at two
+different moments, which need opposite responses:
+
+| Moment | Response | What happens if you get it wrong |
+|---|---|---|
+| Cancelled while queued | Remove it from the queue | The queue fills with ghosts, and live callers are rejected on behalf of callers that left |
+| Cancelled after a slot was granted, before resuming | **Pass the slot on** to the next waiter | The slot is gone permanently |
+
+The second one is the dangerous one, because it is silent. A dropped slot is never recovered: usable
+capacity falls by one for the lifetime of the process, and after `max_concurrent` such events the
+bulkhead rejects everything while truthfully reporting itself full — no failing dependency to blame, and
+nothing in the logs. It is the same failure class as an unresolved permit in the breaker: *a resource
+whose release depends on control returning to code that may never run.* Recognising the class is what
+makes it findable in review.
+
+The cleanup catches `BaseException`, not `CancelledError`, because `coroutine.close()` raises
+`GeneratorExit` — an abandoned coroutine that reached the queue and was then dropped must not leave a
+ghost either. There is a test for precisely that.
+
+### Other decisions worth knowing
+
+- **A freed slot is handed directly to the head of the queue.** The obvious implementation — decrement
+  the in-flight count, wake a waiter, let it re-check capacity — opens a window in which a brand-new
+  caller takes the fast path and walks off with capacity already promised to somebody who has been
+  waiting. Under load that is the normal interleaving, not a rare one, and the queue starves. With direct
+  handover the count never dips, so no such instant exists and FIFO fairness needs no fairness mechanism.
+- **FIFO, and the argument against it is real.** LIFO has genuinely better goodput under sustained
+  overload — the newest request is the one most likely to still have a client attached, while the oldest
+  has probably been abandoned upstream. FIFO wins here anyway because it cannot starve anyone, and
+  because a correctly-sized small queue does not hold a request long enough for the difference to be
+  worth the surprise of "your request waited while later ones were served".
+- **`admitted` counts calls that got a slot they could actually use**, so it is incremented on resumption
+  rather than at handover. Counting at handover would inflate it with calls that never ran — and would do
+  so worst under overload, when cancellations cluster, so the metric would look *better* as the incident
+  deepened. `cancelled_at_handover` is tracked separately, and is also the tell for the silent capacity
+  leak above.
+- **High-water marks, not just averages.** Mean queue depth is approximately zero right up until it
+  isn't, and a one-second shedding spike vanishes into a per-minute average, so a 15 s or 60 s scrape
+  cannot see the thing that hurt. `peak_queued` is the number to size `max_queue` from.
+  `queue_wait_max_seconds` earns its place twice over: queue wait happens entirely *before* the outbound
+  call, so it appears in no dependency's latency dashboard. It is the number that distinguishes "the
+  dependency is slow" from "we are the ones being slow".
+- **`release()` is strict, `__exit__` is tolerant.** A double release returns capacity that was never
+  taken, so the pool would admit more concurrency than configured — the exact failure the bulkhead exists
+  to prevent, reached from the inside, silently — so it raises. `__exit__` has a different job, which is
+  to guarantee the slot comes back; being strict there would crash *during unwinding* and replace a real
+  exception with a bookkeeping complaint.
+- **Not thread-safe, deliberately** — same reasoning as the breaker. Every mutation is straight-line with
+  no `await` between reading and writing state, which is a property to preserve when editing it.
+
 ## Verification
 
 Claims here are limited to what was actually run on the development machine.
 
-**Verified:** 110 unit tests passing in ~0.2 s; `ruff check` and `ruff format --check` clean;
-`mypy --strict` clean across 9 files; and both slices mutation-tested, with **every** reintroduced
+**Verified:** 142 unit tests passing in ~0.3 s; `ruff check` and `ruff format --check` clean;
+`mypy --strict` clean across 11 files; and all three slices mutation-tested, with **every** reintroduced
 defect caught.
 
 Slice 1 — timeout budgets, 10 mutants, 10 caught:
@@ -252,11 +365,44 @@ implementation could plausibly ship:
 | `NOT_COUNTED` recorded as a failure | `test_calls_that_are_not_evidence_do_not_count_toward_throughput` |
 | A config validation check removed | `test_invalid_configuration_is_rejected_at_construction` |
 
+Slice 3 — the bulkhead, 22 mutants, 22 caught. Three of them are caught **by a hang** rather than by an
+assertion, and that is worth reading as a result rather than as a footnote: each of those three breaks the
+handover, which parks a waiter on a future that nobody will ever resolve. A hang is a detected difference
+— CI times out and goes red — so it counts as caught, but it is a worse signal than a failure, because
+what it tells you is "something is stuck somewhere" rather than "this behaviour changed". Reported
+distinctly for that reason.
+
+| Mutant | Caught by |
+|---|---|
+| Pool limit off by one (admits `max_concurrent + 1`) | `test_a_call_beyond_the_limit_waits_in_the_queue` |
+| Queue limit off by one (queues one deeper than configured) | a hang |
+| A rejection is not counted | `test_a_full_pool_and_a_full_queue_reject_immediately` |
+| A cancelled waiter is left in the queue | `test_a_freed_slot_goes_to_the_queue_and_not_to_a_newcomer` |
+| A cancellation at handover drops the slot instead of passing it on | a hang |
+| A cancellation at handover treated as a plain queued cancellation | `test_a_waiter_cancelled_after_being_granted_a_slot_passes_it_on` |
+| `except BaseException` narrowed to `CancelledError` (`GeneratorExit` leaks a queue entry) | `test_a_freed_slot_goes_to_the_queue_and_not_to_a_newcomer` |
+| A released slot is always freed and never handed over | a hang |
+| A handover *also* frees the slot (double release) | `test_a_call_beyond_the_limit_waits_in_the_queue` |
+| A cancelled future in the queue is granted a slot anyway | `test_the_pool_survives_a_cancellation_storm` |
+| The handover does not report that it happened | `test_a_call_beyond_the_limit_waits_in_the_queue` |
+| Double release permitted | `test_releasing_a_slot_twice_raises` |
+| `__exit__` does not release the slot | `test_the_context_manager_releases_the_slot` |
+| Admission counted at handover instead of on resumption | `test_a_call_admitted_after_queueing_is_counted_as_an_admission` |
+| A resumed waiter double-counts its own slot | `test_a_call_beyond_the_limit_waits_in_the_queue` |
+| Queue wait is never measured | `test_queue_wait_is_measured` |
+| Queue-wait maximum overwritten instead of maximised | `test_queue_wait_is_measured` |
+| Peak in-flight not tracked | `test_high_water_marks_record_the_peak_and_not_the_average` |
+| Peak queue depth not tracked | `test_high_water_marks_record_the_peak_and_not_the_average` |
+| `queued_total` also counts calls that never waited | `test_calls_up_to_the_limit_are_admitted_without_waiting` |
+| `max_concurrent` validation removed | `test_construction_rejects_impossible_limits` |
+| `max_queue` validation removed | `test_construction_rejects_impossible_limits` |
+
 **Not verified, and not claimed:** there is no HTTP surface yet, so nothing here has served a real
-request; no load test, no cluster, no cross-host clock-skew experiment. Nothing here has been run
-under real concurrency either — the breaker is documented as single-event-loop and is not
-thread-safe, and that claim is an argument rather than a measurement. Those belong to slice 4 and to
-the sibling reliability project.
+request; no load test, no cluster, no cross-host clock-skew experiment. The bulkhead tests do run many
+tasks concurrently on a real event loop, including cancellation storms — but they run no I/O and no
+threads, so the "not thread-safe, single event loop" claim remains an argument about the code rather
+than a measurement, and so do the sizing formulas above, which are arithmetic and not benchmarks. Those
+belong to slice 4 and to the sibling reliability project.
 
 ### A bug this found
 
@@ -306,6 +452,23 @@ counts contributes nothing whether its stamp is stale or not. Rather than delete
 unconstrained, the invariant it maintains ("a reset window is indistinguishable from a new one") is
 now asserted directly against the internals, with the reasoning written down in the test.
 
+### And two more, in the bulkhead
+
+The slice 3 matrix ran 20/22 on its first pass. Both survivors were test gaps of the same shape as the
+one above — a test that constrained less than its name implied — and both are the kind you cannot see by
+reading:
+
+- **`admitted` counted at handover survived.** Every existing assertion about `admitted` happened to use
+  a queue-free configuration, so no test ever observed the increment on the *queued* path at all. Fixed
+  by a test that queues first and then checks the count.
+- **Overwriting `queue_wait_max_seconds` instead of maximising it survived**, because the test's two waits
+  were 0.4 s then 0.5 s — under which "overwrite" and "take the maximum" produce the same answer. The
+  test was rewritten with the *longer* wait first, which is the only ordering that can tell them apart.
+
+The general lesson, restated because slice 3 found it independently: a test that exercises the right code
+can still be blind to the defect, either because the configuration avoids the path or because the fixture
+values make two implementations agree. Neither is visible on the page.
+
 ## Layout
 
 ```
@@ -315,11 +478,16 @@ src/edge_gateway/
     deadline.py        timeout budgets and their propagation
     window.py          bounded-memory sliding window of successes and failures
     breaker.py         the circuit breaker and its permits
+    bulkhead.py        bounded concurrency with a bounded queue
 tests/
   test_deadline.py     42 tests
   test_window.py       22 tests
   test_breaker.py      46 tests
-DECISIONS.md           architecture decision records
+  test_bulkhead.py     32 tests
+DECISIONS.md           architecture decision records (ADR-001 … ADR-034)
 ```
 
-None of the 110 tests sleep.
+None of the 142 tests sleep. The async ones drive concurrency with `create_task` plus `await
+asyncio.sleep(0)` — a yield to the scheduler, not a wait — and provoke abandonment with `task.cancel()`
+directly instead of with a timer, which is both faster and far more precise than hoping a timeout lands
+in the right window.

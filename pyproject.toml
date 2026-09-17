@@ -29,10 +29,11 @@ where = ["src"]
 # pytest
 # ---------------------------------------------------------------------------
 [tool.pytest.ini_options]
-# `pythonpath` rather than requiring `pip install -e .` first. The point is that
-# `git clone && pytest` works with nothing else run in between — no editable install, no network
-# access, no build step. A test suite that needs a setup ritual is a test suite that stops being run,
-# and on a locked-down machine the "just pip install it" step is exactly where things break.
+# `pythonpath` rather than requiring `pip install -e .` first: no editable install of this package, no
+# build step, no network access at test time. A test suite that needs a setup ritual is a test suite
+# that stops being run, and the build step is the part most likely to be the thing that breaks.
+# (Since slice 3 the suite does need pytest and pytest-asyncio present — see `asyncio_mode` below —
+# but it still never has to *build* or install this project to import it.)
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers --strict-config"
@@ -41,14 +42,19 @@ addopts = "-ra --strict-markers --strict-config"
 # `@pytest.mark.asyncio` misspelt as `@pytest.mark.asyncoi` makes the test silently never run, and a
 # coroutine test function that is never awaited PASSES vacuously.
 #
-# `asyncio_mode = "strict"` belongs here too, and is deliberately absent until slice 3 adds the first
-# async code. Two reasons, and the second is the durable one:
-#   - `--strict-config` (above) makes an unrecognised ini key a hard error, and `asyncio_mode` is only
-#     recognised while pytest-asyncio is installed. Setting it couples "can the suite run at all" to
-#     an optional plugin being present.
-#   - Configuration should not reference tooling the project does not yet use. A settings block that
-#     describes capabilities the code does not have is the same class of defect as a README claiming
-#     an unbuilt feature: it reads as fact and cannot be verified by looking at the code.
+# `asyncio_mode` arrives here with slice 3, which added the first async code — a bulkhead has to be
+# able to wait. `strict` is the right one of the two modes: `auto` puts every coroutine test on an
+# event loop with no marker, which is convenient, and which means a sync test that grows an `await`
+# gets silently reinterpreted instead of reported. Explicit costs one line per test and makes "this
+# test needs a loop" a visible property of the test.
+asyncio_mode = "strict"
+
+# Setting the key does couple the suite to the plugin, which is why it was not set before there was
+# async code to justify it: `--strict-config` makes an unrecognised ini key a hard error, and
+# `asyncio_mode` is only recognised while pytest-asyncio is installed — so a missing plugin fails
+# collection for every test rather than only the async ones. That is the accepted cost, it is why the
+# plugin is pinned in the `dev` extra rather than left to chance, and it is why the README's quick
+# start now installs that extra before running pytest.
 
 # ---------------------------------------------------------------------------
 # ruff
