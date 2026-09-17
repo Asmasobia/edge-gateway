@@ -330,3 +330,325 @@ an unbuilt feature.
 `--strict-markers` *is* on from the start, and earns its place immediately — without it a typo'd
 `@pytest.mark.asyncio` is silently ignored, the coroutine is never awaited, and the test passes
 vacuously.
+---
+
+## ADR-012 — A bucketed ring, not a deque of timestamps
+
+**Status:** accepted (slice 2)
+
+**Context.** The breaker needs the failure *rate over the recent past*. The obvious implementation is a
+deque of `(timestamp, was_success)` pairs with anything older than the window evicted from the front.
+It is exact.
+
+**Decision.** Chop the window into `bucket_count` fixed slots holding two integers each, and stamp each
+slot with the epoch it was written for.
+
+**Why.** The deque's memory scales with THROUGHPUT, not with the window: 20k requests/second over a
+10-second window is 200,000 live entries per breaker per process. The one component whose job is to
+protect the service under load becomes a source of pressure under load, and it grows precisely when
+the service is busiest — the worst possible correlation. Eviction is also unbounded work at an
+arbitrary moment: a quiet period followed by a burst means one unlucky request pays to evict
+everything that expired while nothing was happening. The ring is constant memory (ten buckets is
+twenty integers at any throughput), O(1) to record with no allocation, and O(bucket_count) to read.
+
+**Cost accepted.** Granularity. Events leave a whole bucket at a time, so the effective span varies
+between `window_seconds - bucket_seconds` and `window_seconds` — a 9-to-10-second window with the
+defaults. That is acceptable because the number feeds a threshold comparison on an already-noisy
+sample: "is more than half the traffic failing" does not become wrong because the sample covered 9.4
+seconds rather than ten. It would be unacceptable for billing, or for rate limiting against a
+contractual quota, where the deque is the right choice. Being able to say which of those you are in is
+the point; "buckets are faster" is not an argument, it is a preference.
+
+**Rejected alternative.** A background sweeper to expire buckets on a timer. It needs a lifecycle
+(forgetting to stop it leaks one per breaker), it makes the class untestable without real time, and it
+is unnecessary: because each bucket carries its epoch, expiry can be lazy and free.
+
+---
+
+## ADR-013 — An empty window reports a failure rate of 0.0, not `NaN`
+
+**Status:** accepted (slice 2)
+
+**Context.** `failures / total` with `total == 0` has no correct answer. The options are 0.0, `NaN`, or
+raising.
+
+**Decision.** Return 0.0.
+
+**Why.** This is a choice about which lie is safer, not about which is more truthful. 0.0 means "no
+evidence of failure", so a breaker consulting it does nothing — the fail-safe direction, since with no
+traffic there is nothing to protect. Raising would push the empty case onto every caller. `NaN` is the
+most honest about missing data and the most dangerous in practice: `NaN >= threshold` is False, which
+happens to produce the same behaviour *by accident*, and accidental correctness stops holding the
+moment someone rewrites the comparison as `not (rate < threshold)`.
+
+**Cost accepted.** A caller could mistake a low rate for evidence of health. That is what the breaker's
+minimum-throughput check exists for, and the docstring says so where the two ideas meet.
+
+---
+
+## ADR-014 — Trip on a failure rate over a window, not on consecutive failures
+
+**Status:** accepted (slice 2)
+
+**Context.** "Open after five consecutive failures" is the most common formulation, and the easiest to
+implement — a single counter, reset on success.
+
+**Decision.** Compute a failure rate over a sliding window.
+
+**Why.** A dependency failing 50% of the time is catastrophic and may never produce five failures in a
+row, so a consecutive-failure breaker never fires. Partial failure — one bad replica out of four, a
+degraded shard, an intermittently exhausted connection pool — is the *common* case in distributed
+systems. Total failure is the easy case, and it is the only one a counter detects.
+
+**Cost accepted.** More state and more configuration: a window, a bucket count, a threshold and a
+minimum throughput, versus one integer. Each is a number someone has to choose, and choosing badly
+produces a breaker that looks installed and does not work (see ADR-015 and ADR-023).
+
+---
+
+## ADR-015 — A minimum throughput before the rate is allowed to mean anything
+
+**Status:** accepted (slice 2)
+
+**Context.** A rate needs a denominator, and nothing about the arithmetic requires it to be large.
+
+**Decision.** Draw no conclusion until the window holds at least `minimum_throughput` calls.
+
+**Why.** This is the check most often missing from hand-written breakers, and its absence is
+spectacular rather than subtle. At 03:00 a health check produces one request in the window; it fails;
+the failure rate is 100%; the breaker opens and every subsequent request is rejected on the evidence of
+a single call. The service has taken itself offline over one blip. The guard is a single comparison, and
+what it encodes is only the statistical point that a proportion computed from n=1 is not a measurement.
+
+**Cost accepted.** A genuinely broken dependency called very rarely will not trip the breaker, because
+the evidence never reaches the sample size. That is the correct trade: with that little traffic there
+is little to protect, and `minimum_throughput=1` remains available for a caller who disagrees.
+
+---
+
+## ADR-016 — HALF_OPEN admits a bounded number of probes
+
+**Status:** accepted (slice 2)
+
+**Context.** Recovery has to be discovered somehow, and the only way to learn whether a service is
+healthy is to send it something. The naive half-open state lets all traffic through when the cooldown
+expires and watches what happens.
+
+**Decision.** Admit at most `half_open_max_concurrent` calls at a time; refuse the rest exactly as if
+the circuit were still open. One probe failure re-opens.
+
+**Why.** If the dependency is still fragile — which, having just been broken, is likely — the full
+accumulated load arrives at once and knocks it straight back down. The breaker has become the
+thundering herd it exists to prevent, and on a repeating cycle. Rationing recovery is the whole benefit
+from the dependency's point of view: it comes back up under a trickle rather than under everything that
+was waiting for it.
+
+**Cost accepted.** Recovery is slower, by exactly the amount configured. Requests refused during
+half-open see a `CircuitOpenError` with no `Retry-After`, because a trial slot may free in a
+microsecond or a minute, and inventing a number the client would trust is worse than admitting the wait
+is unknowable.
+
+---
+
+## ADR-017 — The window is reset when the circuit closes
+
+**Status:** accepted (slice 2)
+
+**Context.** On the way back to CLOSED the window still contains the failures that opened the circuit.
+
+**Decision.** Clear the window on the CLOSED transition. Do *not* clear it when tripping.
+
+**Why.** Without the reset, recovery is impossible: the next single failure finds a rate already above
+the threshold and re-opens the circuit immediately, no matter how healthy the dependency now is. The
+symptom is a circuit flapping between OPEN and HALF_OPEN forever while the dependency is verifiably
+fine — and it is a hard bug to see, because every individual state transition looks correct. Tripping
+is the mirror image: the window's contents are the *reason* for the trip, so keeping them means a
+snapshot taken during the incident explains itself.
+
+**Cost accepted.** Immediately after recovery the breaker is blind: it needs `minimum_throughput` fresh
+calls before it can conclude anything, so a dependency that fails again at once is detected a little
+later than it would be otherwise. That is the price of being able to recover at all.
+
+**A note on verifying it.** The test for this initially proved nothing — with the default 10-second
+window and 30-second cooldown, the failures expired on their own while the circuit was open, so
+deleting the reset changed no observable behaviour and left the suite green. Mutation testing found
+that; reading the test did not. It now uses a window longer than the cooldown, which is also the
+configuration under which a missing reset actually bites in production.
+
+---
+
+## ADR-018 — `Outcome` has three values, not two
+
+**Status:** accepted (slice 2)
+
+**Context.** Every call has to be reported back to the breaker. The obvious shape is success or failure.
+
+**Decision.** A third value, `NOT_COUNTED`: the call finished, release its slot, and it is not evidence
+about the dependency's health.
+
+**Why.** A breaker is a hypothesis about one question — *is this dependency unhealthy?* — and anything
+recorded as a failure that is not evidence for that hypothesis makes it fire when it should not. An
+HTTP 400 means *we* sent a bad request; a 404 means the thing does not exist; in both the dependency
+answered correctly and quickly, so a client deploying a 404 bug would otherwise trip the breaker and
+take the dependency out for every other caller. A call refused locally because the time budget was
+exhausted never reached the dependency at all. A bulkhead rejection is evidence about our own
+saturation. Without a third value each of these must be forced into success or failure, and the forcing
+is where breakers acquire their reputation for firing at random. Getting this wrong is the single most
+common way a resilience layer makes a system *less* reliable than it was without one.
+
+**Cost accepted.** A dependency that only ever answers 404 keeps the circuit half-open indefinitely,
+with no failures recorded — because a 404 probe genuinely is not evidence of health. That is correct,
+and it is a state worth being able to recognise on a dashboard. Note also that 429 is deliberately
+*not* in this category: it is the dependency itself saying it cannot serve us.
+
+---
+
+## ADR-019 — Permission is a `Permit` object, and a context manager
+
+**Status:** accepted (slice 2)
+
+**Context.** The simplest API is `if breaker.allow(): ...` followed by `breaker.record_success()`.
+
+**Decision.** `acquire()` returns a `Permit` that must be resolved, and supports `with`.
+
+**Why.** Bounded probe concurrency (ADR-016) requires the breaker to know how many probes are
+*currently in flight*, which is impossible if permission is a fire-and-forget boolean. Something has to
+represent "this call is still running", and making it a value the caller holds is the only shape where
+the breaker can count it. The context manager then closes the failure mode that matters: an unresolved
+permit never decrements the in-flight count, so leaking `half_open_max_concurrent` of them means the
+circuit can never close again for the lifetime of the process — with no failures recorded and nothing
+in the logs to explain it. A `finally` that runs no matter what is the whole defence, which is why it
+is a context manager and not a convention.
+
+An unresolved permit is recorded as `NOT_COUNTED` rather than guessed at. Guessing `FAILURE` would let
+a bug in *our* code trip a breaker on a healthy dependency; guessing `SUCCESS` would hide real
+failures. Because that silence would otherwise be invisible it is counted in `unresolved_permits`,
+which should be zero forever and is therefore a clean thing to alert on.
+
+**Cost accepted.** A slightly heavier API, one object allocated per call, and an exception type callers
+must handle. Resolving a permit twice raises rather than being ignored, because double-counting
+evidence halves the traffic needed to open the circuit.
+
+---
+
+## ADR-020 — Every permit carries a generation, and late outcomes are dropped
+
+**Status:** accepted (slice 2)
+
+**Context.** Calls are concurrent, and a state transition does not cancel work already in flight. A call
+issued while CLOSED can still be running when the circuit trips; a probe can return after the circuit
+has re-opened or closed.
+
+**Decision.** Bump an integer on every transition, stamp it onto each permit, and discard any outcome
+whose stamp does not match — counting it in `stale_outcomes`.
+
+**Why.** Applying a stale outcome is wrong in a specific and damaging way: a late probe *failure* would
+re-open a circuit that has just recovered and is serving traffic happily, with no current evidence of
+any problem at all, producing an incident that is close to unexplainable from the logs. Comparing
+integers makes "is this still relevant?" cheap, with no timestamps to compare and no window to reason
+about. Two details are load-bearing. A stale outcome must not reach the window either, because the
+window was deliberately cleared on recovery (ADR-017) and re-admitting a pre-transition result would
+quietly undo that. And it must not decrement the in-flight probe count, because the transition already
+zeroed that counter — decrementing would steal a slot from the current round and, with enough late
+results, drive the count negative and admit unbounded probes.
+
+**Cost accepted.** Evidence is thrown away. On a busy breaker `stale_outcomes` is expected to be small
+but non-zero; a large value means calls routinely outlive the cooldown, which is itself worth knowing —
+it says the cooldown is too short for this dependency's latency.
+
+---
+
+## ADR-021 — Time-driven transitions are evaluated on access, not by a background task
+
+**Status:** accepted (slice 2)
+
+**Context.** OPEN becomes HALF_OPEN when a duration elapses. Nothing calls the breaker to tell it so.
+
+**Decision.** Apply any due transition at the start of `state`, `acquire` and `snapshot`.
+
+**Why.** The alternative is a task that flips the state when the cooldown expires, and it is worse in
+three ways: it needs a lifecycle, so something must start and stop it and forgetting to stop it leaks a
+task per breaker; it makes the class untestable without real time, which would undo the entire point of
+injecting the clock; and it introduces genuine concurrency into a class that otherwise has none.
+
+**Cost accepted.** Reading a property can change observable state, which is normally a smell. The
+mitigation is conceptual and worth stating precisely: the state is *observed* rather than changed — the
+cooldown had already elapsed whether or not anyone looked. Two tests pin both halves: a probe is
+admitted after a cooldown that nobody watched, and a thousand reads do not extend one.
+
+---
+
+## ADR-022 — Not thread-safe, and no lock
+
+**Status:** accepted (slice 2)
+
+**Context.** `self._half_open_in_flight += 1` is not atomic. Sharing one breaker across OS threads would
+genuinely be unsafe.
+
+**Decision.** Document it, do not lock it.
+
+**Why.** The intended deployment is a single asyncio event loop, and every method runs start to finish
+with no `await` inside it — so each is already atomic with respect to other coroutines. A lock would
+buy nothing there and would cost an acquisition on the hottest path in the gateway. Worse, it would
+make an actual misuse silent: a breaker shared across threads is a design conversation about what a
+breaker's opinion is scoped to, and a lock answers that question by hiding it.
+
+**Cost accepted.** A caller who ignores the documentation gets a data race. The honest response is a
+note in the docs and in the module docstring rather than a lock that turns a design error into a
+permanent performance cost. Related: one breaker per dependency, never one per process — a shared
+breaker means a failing search service stops calls to a healthy payments service, converting a partial
+outage into a total one.
+
+---
+
+## ADR-023 — Every threshold is required; `bucket_count` is the only default
+
+**Status:** accepted (slice 2)
+
+**Context.** `BreakerConfig` has seven fields. Library defaults for all of them would make the breaker a
+one-liner to construct.
+
+**Decision.** Six are required with no default. `bucket_count` defaults to 10. Construction validates
+every field and raises on anything unusable.
+
+**Why.** Same argument as the timeout budget's `default_ms` (ADR-007): what counts as "too many
+failures" for a payments provider is not what it means for a recommendations service, and a shared
+default is how an entire fleet inherits a number nobody chose and then discovers it during an incident.
+`bucket_count` is a principled exception because it is not a policy decision about the dependency at
+all — it is an internal accuracy-versus-memory trade inside the window, the way a hash table has a
+default load factor.
+
+Validation is not defensive padding. Each rejected value produces a breaker that *looks* installed and
+does not work, which is worse than having none because it is believed in. A `failure_rate_threshold` of
+0 opens on any traffic at all, because an empty window reports 0.0 and `0.0 >= 0.0`. Above 1.0 is
+unreachable, so the breaker is present, configured, monitored and inert. A `half_open_max_concurrent`
+of 0 admits no probes, so the circuit can never leave HALF_OPEN — permanently open, with no error and
+nothing in the logs.
+
+**Cost accepted.** Verbose construction, and a startup failure for a configuration that would
+previously have started. Both are the intent: fail at deploy time rather than at 3am.
+
+---
+
+## ADR-024 — An unobservable invariant is asserted on internals rather than deleted
+
+**Status:** accepted (slice 2)
+
+**Context.** Mutation testing found one line in `SlidingWindow.reset` that no test constrained: clearing
+the per-bucket epoch stamps. It is genuinely unobservable through the public surface, because a bucket
+whose counts are zero contributes nothing whether its stamp is stale or current.
+
+**Decision.** Keep the line and assert the invariant it maintains — "a reset window is
+indistinguishable from a new one" — directly against the private arrays, with the reasoning in the
+test.
+
+**Why.** Two honest options existed. Deleting the line is defensible: this codebase argues elsewhere
+that unreachable code cannot be tested and untested code should not be trusted, and it leaves
+`_settle`'s unreachable OPEN branch unwritten for exactly that reason. But that argument applies to
+*branches*, not to a state-restoring invariant: keeping "reset returns the object to its constructed
+state" true is what stops a later change — a per-bucket flag, or an aggregate maintained alongside the
+buckets — from leaving half the state behind. An invariant nothing checks is a comment.
+
+**Cost accepted.** One test reaches into private attributes and will need updating if the
+representation changes. That is the correct coupling: the test exists precisely to catch a
+representation change that forgets part of the reset.

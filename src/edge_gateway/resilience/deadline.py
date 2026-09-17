@@ -1,10 +1,10 @@
 """Timeout budgets: one deadline for a whole request, propagated across hops.
 
 THE PROBLEM THIS SOLVES
--------------------------------------------------------------------------------- Almost every
-service configures timeouts *per call*: "the call to the pricing service times out after 1 second".
-That is a local statement, and it composes badly. Consider a client with a 1 s expectation calling a
-gateway that calls A, which calls B, which calls C, each hop configured with "1 second":
+--------------------------------------------------------------------------------
+Almost every service configures timeouts *per call*: "the call to the pricing service times out
+after 1 second". That is a local statement, and it composes badly. Consider a client with a 1 s
+expectation calling a gateway that calls A, which calls B, then C, each hop set to "1 second":
 
     client(1s) -> gateway(1s) -> A(1s) -> B(1s) -> C(1s)
 
@@ -28,11 +28,11 @@ the project — a config file that sets `timeout: 1s` demonstrates nothing about
 deadlines.
 
 DEADLINE, NOT TIMEOUT
--------------------------------------------------------------------------------- The distinction is
-the whole design. A *timeout* is a duration and it is relative to whenever you happen to start
-counting, which is why it resets at every hop. A *deadline* is a point in time; it is absolute, so
-passing it down cannot extend it. Internally this class stores `expires_at`, an absolute monotonic
-instant, and every duration is derived from it. There is no field holding "the timeout".
+--------------------------------------------------------------------------------
+The distinction is the whole design. A *timeout* is a duration and it is relative to whenever you
+happen to start counting, which is why it resets at every hop. A *deadline* is a point in time; it
+is absolute, so passing it down cannot extend it. Internally this class stores `expires_at`, an
+absolute monotonic instant, and every duration is derived from it — no field holds "the timeout".
 
 WHY THE WIRE FORMAT IS A DURATION EVEN THOUGH THE MODEL IS ABSOLUTE
 --------------------------------------------------------------------------------
@@ -120,7 +120,7 @@ class BudgetSource(Enum):
                  That is invisible unless this distinction is recorded, which is exactly why it is
                  here.
     - CLAMPED    the request asked for more than the ceiling allows. Worth a metric: a caller that
-      is regularly clamped either has an unrealistic expectation or is trying it on.
+                 is regularly clamped either has an unrealistic expectation or is trying it on.
     - MALFORMED  a syntactically invalid value. Always someone's bug; someone should be told.
     """
 
@@ -211,7 +211,7 @@ class Deadline:
     def downstream_budget_ms(self, *, reserve_ms: int) -> int:
         """The budget to hand to the next hop: what is left, minus a reserve, floored at zero.
 
-        WHY A RESERVE The remaining budget cannot all be given away. Between "downstream returned
+        WHY A RESERVE: the remaining budget cannot all be given away. Between "downstream returned
         its answer" and "the client has the response" there is still work to do: read and
         deserialise the response, run whatever this hop exists to do with it, serialise our own
         response, and put it on the wire. Hand over 100% and the sequence that follows is downstream
