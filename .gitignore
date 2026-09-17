@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local configuration. `.env.example` IS tracked; `.env` never is — it is where machine-specific
+# paths, ports and credentials live, and the only reliable way to keep them out of history is to make
+# the file unstageable rather than to remember not to stage it.
+.env
+
+# Scratch space for mutation-testing runs (see DECISIONS.md). Untracked on purpose: a killed run
+# leaves it behind, and inside the repo that becomes untracked files that eventually get committed.
+.mutation/

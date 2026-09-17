@@ -1,0 +1,10 @@
+# Line endings are a property of the repository, not of whoever happens to clone it.
+#
+# Without this file, what lands in a commit depends on each contributor's `core.autocrlf` setting.
+# A Windows contributor with `autocrlf=false` commits CRLF, and the next contributor on Linux shows
+# every line of the file as changed — a whole-file diff that hides the two lines actually edited and
+# makes `git blame` useless for that file forever after.
+#
+# `text=auto` lets Git decide which files are text; `eol=lf` fixes what text files look like in the
+# repository. Working copies still get native endings on Windows, so nothing about editing changes.
+* text=auto eol=lf

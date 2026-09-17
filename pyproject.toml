@@ -1,0 +1,81 @@
+[project]
+name = "edge-gateway"
+version = "0.1.0"
+description = "A resilience-aware edge gateway: timeout budgets, circuit breaking and bulkheads."
+requires-python = ">=3.12"
+
+# The RESILIENCE CORE has no runtime dependencies, deliberately — see DECISIONS.md ADR-002.
+# `fastapi`/`httpx`/`uvicorn` arrive in slice 4 when there is actually an HTTP surface to serve;
+# declaring them now would be declaring a dependency nothing imports, which is how a dependency
+# list stops being a description of the software and becomes folklore.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest~=9.1",
+    "pytest-asyncio~=1.3",
+    "ruff~=0.16",
+    "mypy~=2.3",
+]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+# `pythonpath` rather than requiring `pip install -e .` first. The point is that
+# `git clone && pytest` works with nothing else run in between — no editable install, no network
+# access, no build step. A test suite that needs a setup ritual is a test suite that stops being run,
+# and on a locked-down machine the "just pip install it" step is exactly where things break.
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+
+# `--strict-markers` above turns a typo'd marker into an error instead of a silent no-op. Without it,
+# `@pytest.mark.asyncio` misspelt as `@pytest.mark.asyncoi` makes the test silently never run, and a
+# coroutine test function that is never awaited PASSES vacuously.
+#
+# `asyncio_mode = "strict"` belongs here too, and is deliberately absent until slice 3 adds the first
+# async code. Two reasons, and the second is the durable one:
+#   - `--strict-config` (above) makes an unrecognised ini key a hard error, and `asyncio_mode` is only
+#     recognised while pytest-asyncio is installed. Setting it couples "can the suite run at all" to
+#     an optional plugin being present.
+#   - Configuration should not reference tooling the project does not yet use. A settings block that
+#     describes capabilities the code does not have is the same class of defect as a README claiming
+#     an unbuilt feature: it reads as fact and cannot be verified by looking at the code.
+
+# ---------------------------------------------------------------------------
+# ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # import sorting
+    "B",        # flake8-bugbear — catches the mutable-default and except-blind classes of bug
+    "UP",       # pyupgrade — keeps the code in modern idiom, which is one of the stated gaps
+    "ASYNC",    # flake8-async — flags blocking calls inside async def, the bug this project is about
+    "RUF",
+]
+
+# ---------------------------------------------------------------------------
+# mypy
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+# Matching the bar already set in settlement-engine: `mypy --strict` clean, no per-file opt-outs.
+# `warn_unreachable` is the one worth calling out — it catches a guard clause that can never fire,
+# which is the usual symptom of a state machine whose transitions do not mean what the author thought.
