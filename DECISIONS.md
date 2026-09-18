@@ -943,3 +943,641 @@ never has to *build* this project, but it is no longer true that it needs nothin
 **Cost accepted.** A marker on every async test, and a hard dependency on one pytest plugin. Recorded as
 a supersession rather than an edit to ADR-011, because the interesting part is not the current setting —
 it is that the decision was correct when made and stopped being correct when the code changed.
+
+---
+
+## ADR-035 — The three patterns are composed in one fixed order, and the order is the design
+
+**Status:** accepted (slice 4)
+
+**Context.** Slices 1-3 produced a deadline, a breaker and a bulkhead that know nothing about each other.
+Composing them requires choosing a nesting order, and there are six orderings of three protections. All
+six *work*: every one of them refuses the right requests with the right status codes, and every one of
+them passes a test suite written per component.
+
+**Decision.** One order, fixed in `Guard.call` and not configurable: deadline viability → breaker permit →
+bulkhead slot → deadline viability *again* → the call.
+
+**Why.** The generating rule is that the cheapest refusal comes first, and nothing is acquired before
+something that could have refused without it. Viability is one subtraction and consumes nothing, so it is
+free to check and it makes every later step conditional. The breaker check is a comparison against an
+integer and can never block, so there is no reason for a scarce bulkhead slot to be held while it runs —
+invert those two and a caller waits in the queue for its whole budget and *then* learns the circuit was
+open the entire time, having occupied a queue position that a viable request could have used. The bulkhead
+slot is the scarcest resource in the composition, so it is acquired last and held for exactly the duration
+of the outbound call.
+
+The order being fixed rather than configurable is part of the decision. A knob here would be a knob whose
+wrong settings are indistinguishable from its right ones in every test, and whose cost only appears as
+latency during an outage.
+
+**Cost accepted.** A real one, and it bites in exactly one state. Because the breaker is outside, its
+permit is held while we wait for a bulkhead slot — and in HALF_OPEN that permit is one of a small bounded
+number of probe slots (ADR-016). A request stuck in the queue is therefore occupying probe capacity
+without probing anything, and in the worst case every probe slot is held by a queued request and recovery
+stalls until the deadlines expire.
+
+Accepted because the wait is bounded by the deadline, so the stall is temporary by construction, and
+because the alternative ordering pays its cost on *every* request in the far more common OPEN state. The
+fix, if it ever bites in practice, is to acquire the slot with an effective `max_queue` of zero for trial
+calls — not to reorder.
+
+**Rejected alternative.** Middleware layers, one per pattern, stacked in ASGI. It reads beautifully and it
+cannot express the second viability check, because that check has to happen *between* two layers'
+acquisitions rather than around them. It also makes the whole composition available only to HTTP, which
+ADR-002 spent a slice avoiding.
+
+---
+
+## ADR-036 — Two separate timeout scopes, not one, because a timeout has to be attributable
+
+**Status:** accepted (slice 4)
+
+**Context.** The obvious implementation wraps the bulkhead wait and the outbound call in a single
+`asyncio.timeout(remaining)`. One budget, one scope, and the total behaviour is correct: the request is
+abandoned when the client's time runs out, wherever it happened to be.
+
+**Decision.** Two scopes. One around the bulkhead wait in `_acquire_slot`, raising `SlotWaitExpiredError`
+and recording NOT_COUNTED; a second around the call itself in `_invoke`, raising `UpstreamTimeoutError`
+and recording FAILURE.
+
+**Why.** With one scope the two timeouts are the same exception, and they mean opposite things. Timed out
+while queued means the dependency was never called — that is evidence that *we* are saturated. Timed out
+during the call means the dependency was called and did not answer — that is exactly what a breaker is
+for. Collapse them and every period of local saturation records failures against a dependency that was
+healthy throughout, which trips its breaker, sheds traffic that had nothing to do with the saturation, and
+turns our capacity problem into their outage. The single scope is not a simplification; it is ADR-018's
+classification bug re-entering through the back door.
+
+The distinction is also what makes the two refusals separately *fixable*: a full queue says the queue is
+too shallow for the burst, an expired wait says it is too deep for the budget, and those move `max_queue`
+in opposite directions.
+
+**Cost accepted.** The budget is recomputed between the scopes rather than captured once, which is one
+extra clock read per request and one more place the reserve has to be applied correctly. Recomputation is
+mandatory rather than incidental: a captured value would hand the outbound call a budget measured before
+the queue wait, restoring the overrun the reserve exists to prevent.
+
+**Rejected alternative.** One scope plus a flag recording where we were when it fired. That is the same
+information, obtained less reliably: the flag has to be set and cleared around every await, and the first
+time somebody adds a step between them the attribution is silently wrong.
+
+---
+
+## ADR-037 — `classify` is a parameter of the call, not a rule inside the guard
+
+**Status:** accepted (slice 4)
+
+**Context.** The guard has to decide what each result means to the breaker. The natural place for that is
+inside the guard: check the status code, record success or failure, done.
+
+**Decision.** `Guard.call` takes `classify: Callable[[T], Outcome]` and applies it to whatever `operation`
+returned. The guard has no opinion about status codes; `classify_status` is a default that the *gateway*
+layer supplies.
+
+**Why.** Two reasons, and the second is the load-bearing one.
+
+"What counts as a failure" is genuinely dependency-specific. A service that answers a cache miss with 503
+is not unhealthy, however unwise that design is, and a caller who knows that must be able to say so
+without patching the composition layer. Hard-coding the rule means the only way to express an exception to
+it is a fork.
+
+More importantly, a guard that reads `response.status_code` is a guard that only works for HTTP — which
+would put `resilience/` in the position ADR-002 exists to prevent. `classify` being a parameter is what
+lets the same composition protect a database call or a gRPC stub, and it is why `guard.py` imports nothing
+from `gateway/`. The generic parameter is on the method rather than the class so that one guard can protect
+operations with different result types and mypy still checks that `classify` accepts what `operation`
+produces.
+
+**Cost accepted.** Every call site has to supply a classifier, including the trivial ones, and a caller who
+supplies a careless one (`lambda _: Outcome.SUCCESS`) has silently disabled their breaker. That is a real
+footgun and it is preferred to the alternative footgun, which is a rule nobody can see and nobody can
+override.
+
+---
+
+## ADR-038 — The outbound HTTP client applies no timeout of its own
+
+**Status:** accepted (slice 4)
+
+**Context.** `httpx.AsyncClient` defaults to a five-second timeout on connect, read, write and pool
+acquisition. It is a good default for a user agent. This client is not a user agent: every call it makes
+is already inside `asyncio.timeout(budget)` in `Guard._invoke`.
+
+**Decision.** `timeout=None` on the client, and the guard is the only thing that bounds a call.
+
+**Why.** Two timeouts for one call are two deadlines with no relationship to each other. Whichever fires
+first decides the outcome; which one that is depends on two numbers configured in two files that nobody
+reads together; and the number that loses is the request's actual budget — the only one that reflects what
+the client is still waiting for. The failure is quiet and permanent: a dependency configured with a 900 ms
+budget is abandoned at 5 s by httpx if the deadline is longer, or the deadline is pre-empted at 5 s even
+when the caller granted 30. Nothing errors, and the numbers in the config file simply stop being the
+numbers in effect.
+
+The guard owns the timeout because the guard is the only thing that knows the budget, and the budget is the
+only defensible basis for giving up.
+
+**Cost accepted.** If the guard's timeout were ever bypassed — a call made outside `Guard.call` — there
+would be nothing to stop it, and it would hang until the client disconnected. Two things mitigate that:
+`Upstream.forward` is the only method that touches the client, and `errors.py` keeps a live branch mapping
+`httpx.TimeoutException` to its own reason slug even though the branch should be unreachable, so if a
+timeout we do not own ever does fire, `x-gateway-refusal: client-timeout` says so in a dashboard rather
+than being folded into the 502 rate.
+
+**Rejected alternative.** Setting httpx's timeout to the remaining budget per request. It duplicates the
+authoritative number into a second mechanism, which is the same class of bug one step smaller, and it would
+still leave two exceptions to attribute instead of one.
+
+---
+
+## ADR-039 — The connection pool is sized to the bulkhead, not configured separately
+
+**Status:** accepted (slice 4)
+
+**Context.** `httpx.Limits` and `max_concurrent` both bound how many calls can be in flight to a
+dependency. They are independent settings in independent objects, and the obvious thing is to expose both.
+
+**Decision.** `max_connections` and `max_keepalive_connections` are both set to `max_concurrent`, in
+`Upstream.__init__`, with no way to configure them separately. The client is built inside `Upstream` rather
+than accepted as a parameter specifically so that a caller cannot pass one whose pool disagrees.
+
+**Why.** A pool smaller than the bulkhead is a second queue, inside httpx, that the bulkhead cannot see.
+Calls the bulkhead has already admitted then wait for a connection — and that wait appears in no metric
+this project exposes, is bounded by nothing httpx knows about, and shows up as inexplicable latency inside
+a call that the gateway believes is in flight. It is the exact failure the bulkhead was built to make
+visible, reintroduced one layer down where nothing is watching.
+
+Equality is the only value that cannot lie. The bulkhead already guarantees no more than `max_concurrent`
+calls are in flight, so a pool of that size can never be the binding constraint and can therefore never
+queue. Larger would be dead capacity that exists only to be misread as headroom.
+
+**Cost accepted.** `max_keepalive_connections` equal to `max_concurrent` means idle sockets are held open
+up to the bulkhead's width per upstream. For the small concurrency limits this project is about that is
+cheap, and it is the right trade: a keep-alive pool smaller than the concurrency limit means a share of
+requests pay a fresh TCP and TLS handshake under exactly the load where latency matters most.
+
+**Also accepted:** this is the one slice-4 invariant with no test behind it. Asserting it requires either
+reaching into httpcore's private pool (`_transport._pool._max_connections`, which breaks on a patch
+release) or standing up a real server, because with an injected `MockTransport` the limits never reach a
+connection pool at all. It is pinned by the mutation matrix instead — the mutation exists and is recorded
+as a survivor rather than quietly dropped — and the README's mutation table says so.
+
+---
+
+## ADR-040 — Only the dependency's own answers are evidence; every self-inflicted refusal is NOT_COUNTED
+
+**Status:** accepted (slice 4)
+
+**Context.** Every path out of `Guard.call` has to resolve its breaker permit. There are eight: a
+classified response, a budget exhausted on arrival, a budget exhausted after queueing, a full
+bulkhead, an expired slot wait, our own timeout, a cancellation, and an exception from the operation.
+
+**Decision.** Exactly two of them count. `UpstreamTimeoutError` is FAILURE, and an exception raised by the
+operation itself is FAILURE. Everything the *gateway* decided — bulkhead full, slot wait expired, budget
+exhausted, client cancelled — is NOT_COUNTED. A classified response is whatever `classify` says, which for
+HTTP means 4xx is NOT_COUNTED except 408 and 429, and 5xx is FAILURE except 501 and 505.
+
+**Why.** A breaker is a hypothesis about one question: is this dependency unhealthy? Every outcome fed into
+it is a vote on that question, and a refusal we generated ourselves is not a vote — it is a statement about
+our own capacity or about the caller's budget. Count them and the breaker opens *because* we were busy,
+which sheds traffic to a healthy dependency at the moment we could least afford to lose the capacity, and
+the resulting incident looks like a dependency outage with no dependency involved.
+
+The failure mode this prevents is not a crash, which is why it deserves an ADR of its own: a breaker that
+fires spuriously does not get fixed, it gets its threshold raised, and raised again, until it never fires
+at all. The component is then still installed, still monitored and completely inert — which is worse than
+not having it, because everyone believes it is there.
+
+Cancellation is NOT_COUNTED for a slightly different reason: it is ambiguous by nature — the dependency may
+have been about to answer perfectly — and the honest reading of an ambiguous signal is "no evidence".
+Guessing FAILURE would let a wave of client disconnects trip breakers on every dependency at once, turning
+a client-side problem into a fleet-wide one.
+
+**Cost accepted.** A dependency so slow that every caller times out *while queued* will not trip its
+breaker, because those timeouts are ours. That is intentional — the queue depth is the thing to fix — and
+it is visible: `slot-wait-expired` in the refusal header, and `queue_wait_max_seconds` in the bulkhead
+snapshot, both point at us rather than at them.
+
+**Implementation note.** Each refusal path calls `permit.not_counted()` explicitly rather than relying on
+`Permit.__exit__`, which records the same outcome. `__exit__` also increments `unresolved_permits`, a
+counter that is meant to be zero forever and alertable on (ADR-024); letting a routine refusal bump it
+would make that signal useless within a day.
+
+---
+
+## ADR-041 — The shared outbound client remembers no cookies
+
+**Status:** accepted (slice 4)
+
+**Context.** `httpx.AsyncClient` is a user agent. It keeps a cookie jar, stores every `Set-Cookie` it sees,
+and replays the jar on later requests to the same host. That is correct for a browser-like client and it is
+a security defect in a shared proxy, where one client instance serves every caller:
+
+    1. Caller A logs in. The dependency answers `Set-Cookie: session=SECRET`.
+    2. Our client stores `session=SECRET`.
+    3. Caller B — a different person, holding no credentials — requests anything.
+    4. httpx attaches `Cookie: session=SECRET` to B's outbound request.
+
+**Decision.** `_CookielessAsyncClient` overrides the `cookies` property to return a permanently empty jar
+whose `extract_cookies` does nothing. The setter is a silent no-op.
+
+**Why.** This is a cross-caller credential leak with no bug anywhere in this project's own code — one line
+of default behaviour in a well-behaved library. It was found by writing a test that logged in as one caller
+and then issued an unrelated request as another, asserting on what the *dependency* saw. Neither caller can
+observe it from its own side, so a test that checks status codes and bodies passes cheerfully.
+
+The property is overridden rather than the jar cleared after each response, because clearing is a race:
+with `max_concurrent` above one, B's request is built between A's response being stored and the clear
+running, so the leak reappears under exactly the concurrency this project exists to handle —
+intermittently, which is worse than reliably. Passing `cookies=` to the constructor does not work either,
+because httpx wraps whatever it is given in a fresh `Cookies` and discards the subclass. Overriding the
+property is what holds, because httpx reads `self.cookies` at both the store site and the inject site.
+
+**Cost accepted.** A subclass of a third-party client, coupled to the fact that httpx reads cookies through
+that attribute; if httpx changed to a private field the override would stop working silently. That is why
+the regression test asserts on the outbound request rather than on the jar — it fails if the mechanism ever
+stops holding, for any reason.
+
+The setter being a silent no-op rather than raising is deliberate. Raising is more honest in the abstract
+and worse in practice: httpx assigns to `cookies` in code paths we do not control, and a proxy that crashed
+rather than declining to remember a cookie would trade a fixed leak for an outage.
+
+---
+
+## ADR-042 — Redirects are handed back to the caller, never followed
+
+**Status:** accepted (slice 4)
+
+**Context.** `follow_redirects` is off by default in httpx and on by default in most other clients, and
+turning it on is how a proxy stops returning 302s that "don't work".
+
+**Decision.** `follow_redirects=False`, and a 3xx is proxied back like any other response.
+
+**Why.** A 301 is a real answer, and it is the answer the client asked for. It may want to cache it,
+rewrite it, present it to a user, or decline to follow it — none of which it can do if we followed it and
+returned the destination instead.
+
+The resilience argument is the stronger one. A followed chain spends one budget and holds one bulkhead slot
+for however many calls it takes, and records only the last outcome against the breaker. So a dependency
+stuck in a redirect loop looks perfectly healthy while consuming everything, which is precisely the shape
+of failure every component in this project was built to make visible.
+
+**Cost accepted.** A client that does not follow redirects will see a 3xx where it may have expected a 200.
+That is standards-correct behaviour and it is what a well-behaved reverse proxy does; the `Location` header
+is forwarded untouched, so a client that does follow redirects is unaffected. Note that `classify_status`
+counts a 3xx as SUCCESS (ADR-040), because a redirect is a correct, cheap, fast answer.
+
+---
+
+## ADR-043 — Headers are filtered per direction, and the `Connection` header's contents are honoured
+
+**Status:** accepted (slice 4)
+
+**Context.** `outbound.headers = incoming.headers` is the line every hand-rolled proxy starts with. RFC
+9110 §7.6.1 splits fields into end-to-end (describing the message, forward them) and hop-by-hop
+(describing this TCP connection, meaningless one hop further on).
+
+**Decision.** `headers.py` drops the hop-by-hop set in both directions, plus a direction-specific set:
+`host`, `content-length` and `x-timeout-budget-ms` outbound; `content-length` and `content-encoding`
+inbound. It also parses the `Connection` header and drops every field name listed in it. Headers travel as
+a list of pairs throughout, never a dict.
+
+**Why.** Each exclusion is a bug whose symptom points away from the gateway:
+
+* `Connection: close` copied outbound tears down a pooled connection after every request — the latency of
+  having no pool, with a pool's memory cost and no error anywhere.
+* `host` names *us*, so a virtual-hosted origin serves the wrong site, or on a shared host somebody else's.
+* `content-length` from the original message is stale, because this hop buffers and may change the length.
+  Short truncates the body silently; long makes the peer wait for bytes that never arrive until its own
+  read timeout fires. Both clients compute it correctly from the bytes they are handed, so the fix is to
+  say nothing.
+* `content-encoding` inbound is the subtle one: httpx decompresses transparently, so `response.content` is
+  plain bytes even when the origin sent gzip. Relaying `content-encoding: gzip` beside it tells the client
+  to inflate plaintext, and the decode error appears to come from the origin.
+* `x-timeout-budget-ms` forwarded verbatim would hand the dependency the time we had when the request
+  *arrived*, silently un-spending the queue wait and our own work. `Upstream.forward` adds the recomputed
+  one after the filter has run, so a client cannot suppress it by sending its own.
+
+Consulting the `Connection` header's contents costs one split and closes the extensibility the RFC defines:
+`Connection: close, X-Internal-Trace` means `X-Internal-Trace` is hop-by-hop for that connection and must
+not be forwarded. Ignoring it is how a peer's connection-scoped header leaks to an origin with no business
+seeing it. A malformed value is tolerated rather than raised on — forwarding one header too few is a much
+better outcome than failing a well-formed request.
+
+Pairs rather than a dict because HTTP allows repeated field names and one of them matters constantly:
+`Set-Cookie` is repeated, not comma-joined, and comma-joining is invalid because cookie values may contain
+commas. A dict keeps the last occurrence, so a login response setting a session cookie and a CSRF cookie
+loses one — presenting as "login works but the next request is unauthenticated", intermittently, depending
+on header order.
+
+**Cost accepted.** The outbound filter is a deny-list, so a header nobody thought of is forwarded. That is
+the right default in this direction: a proxy that forwards only headers it recognises breaks the next
+application header somebody adds, and breaks it *silently* — the request succeeds and behaves as though the
+header were absent, which is far harder to diagnose than a rejection. The opposite choice would be correct
+at a security boundary filtering untrusted input into a trusted network; this gateway does not claim to be
+that, and the README says so rather than implying a guarantee it does not provide.
+
+---
+
+## ADR-044 — Bodies are buffered, not streamed
+
+**Status:** accepted (slice 4)
+
+**Context.** `await request.body()` reads the whole request into memory and `httpx` without `stream=True`
+reads the whole response into memory. A streaming proxy would hold neither, and streaming is what a
+production proxy does.
+
+**Decision.** Buffer both. The response is read to completion *inside* the guard, so the bulkhead slot and
+the timeout both cover the body transfer.
+
+**Why.** Buffering is what makes every other guarantee in this project simple and true. The bulkhead slot
+covers the entire interaction, so no call is "finished" while still consuming a socket. The timeout covers
+the entire transfer, so a dependency that sends headers instantly and then dribbles a body cannot evade the
+budget — which is the most common way a hanging dependency hides from a naive proxy. And the thing
+`classify` is given is a complete response.
+
+Streaming makes all three conditional on where the consumer stops reading, which means the resilience
+properties would depend on client behaviour rather than on our own configuration. Releasing the slot at the
+headers would leave the part most able to occupy a worker for a long time — a large body over a slow link —
+outside both limits.
+
+**Cost accepted.** Real, and stated in the README rather than left to be discovered: memory proportional to
+body size for the duration of each call, which makes this gateway unsuitable for file transfer, and
+unusable for server-sent events or any long-lived streaming response, which would buffer until the
+connection closed — that is to say, forever.
+
+---
+
+## ADR-045 — An unrecognised exception maps to no refusal, so our own bugs stay 500s
+
+**Status:** accepted (slice 4)
+
+**Context.** `refusal_for` is a table of `isinstance` checks. Every table needs a fall-through, and the
+tidy choice is a catch-all 502: the client always gets a sensible answer and no traceback escapes.
+
+**Decision.** `return None`. The handler re-raises, the framework produces a 500, and a traceback naming
+our own file lands in the log.
+
+**Why.** It is one line and it is the most valuable line in the module. A `KeyError` in our own routing
+reported as 502 sends every investigation to the dependency and *keeps it there*, because a 502 from a
+gateway means "upstream is broken" to everybody who reads one. The dependency's owners find nothing,
+because there is nothing to find.
+
+The same reasoning is why no refusal in the table is a 500. Every refusal in it is the gateway working as
+designed, and using 500 for deliberate load-shedding destroys the one signal that reliably means somebody
+must be paged: a 500 rate that rises during every traffic spike is a 500 rate nobody looks at. The two
+decisions are halves of one rule — 500 means we have a bug, and nothing else may borrow it.
+
+**Cost accepted.** A bug in the gateway produces a bare 500 with no reason header and a framework-shaped
+body, which is less polished than the refusals. That is the intended asymmetry: refusals are a product
+surface, and a 500 is an alert.
+
+---
+
+## ADR-046 — Refusals carry a reason header, and the exception's own message is never in the body
+
+**Status:** accepted (slice 4)
+
+**Context.** Five distinct refusals collapse onto two status codes. Inventing private status codes would
+break every intermediary that understands the standard ones, and the client genuinely only needs "retry
+later" or "the deadline passed".
+
+**Decision.** The slug travels in `x-gateway-refusal`, and in a JSON body of `{"error": "<slug>"}`. The
+exception's message is kept on `Refusal.detail` for logging and never sent.
+
+**Why.** *We* need the distinction the status code cannot carry, because the five refusals have five
+different fixes — go and look at the dependency, raise `max_concurrent`, lower `max_queue`, talk to the
+caller about its budget, or investigate a dependency that stopped answering. One label is cheap to log,
+cheap to graph, and usable as a breakdown of a single 503 line in a dashboard. Deriving the same
+information from the status code is impossible; deriving it by grepping message prose is possible and
+awful.
+
+Withholding the detail is a security decision, not tidiness. `BulkheadFullError`'s message contains
+in-flight count, queue depth and queue capacity. Handed to an untrusted caller, that is a free readout of
+how much load we can absorb and how close to the limit we are right now — precisely the reconnaissance a
+load-based attack wants, and it turns the attack from guesswork into a measurement.
+
+`Retry-After` is sent only where a number can be justified — an open circuit, whose cooldown the breaker
+scheduled itself. A full bulkhead gets none, because saturation has no scheduled end and any value would be
+fiction that also synchronises every refused client onto one instant, producing a thundering herd we caused
+ourselves at the moment we were already out of capacity. Where the header is sent it is rounded *up*, with
+a floor of one second: `delta-seconds` is an integer (RFC 9110 §10.2.3), and rounding down turns a 0.4 s
+cooldown into `Retry-After: 0`, which is an instruction to retry immediately and reproduces exactly the
+hammering the breaker opened to stop.
+
+**Cost accepted.** A custom header is a private contract, so anything consuming it is coupled to our slugs;
+the slugs are therefore treated as an API and changed only with an ADR. And an operator debugging from a
+client's transcript alone cannot see the detail — they need the log line, which is the correct place for
+it.
+
+---
+
+## ADR-047 — Routing is by first path segment, and the reserved names are rejected at startup
+
+**Status:** accepted (slice 4)
+
+**Context.** A gateway has to map a request to an upstream. The options are regex or pattern routes, `Host`
+header routing, or something simpler.
+
+**Decision.** The first path segment names the upstream and is stripped: `/search/products?q=x` reaches the
+upstream `search` as `/products?q=x`. Both `/{upstream_name}` and `/{upstream_name}/{path:path}` route to
+the same handler, because the second does not match `/search` — the literal slash is required — and an
+upstream whose root is the useful endpoint is entirely normal. `UpstreamConfig` rejects `healthz` and
+`resilience` as names.
+
+**Why.** The property worth keeping is that **the URL in an access log tells you which breaker and which
+bulkhead a request used**, with no lookup and no config file open beside you. At 3am that is worth more
+than flexibility, and it is easy to give up and hard to get back. Pattern routing is more flexible and buys
+nothing this project needs.
+
+Rejecting the reserved names is the first line of defence and declaration order is the second, not the
+other way round. Starlette matches in declaration order, so registering `/healthz` before the catch-all is
+necessary — but on its own it means an upstream named `healthz` is not *mostly* broken, it is silently and
+permanently unreachable, and every request to it gets a cheerful `{"status": "ok"}` from us. Something is
+clearly answering, so that is diagnosed as a service-discovery or networking problem, for a day. A startup
+error naming the field costs nothing by comparison.
+
+The query string is re-attached as the raw string it arrived as, never parsed and re-encoded.
+Round-tripping is lossy in ways that break real APIs: parameter order is lost, repeated keys may be
+collapsed, and `+` versus `%20` versus a literal space are decisions the client already made. A proxy
+passes the query through unchanged; it does not normalise it.
+
+**Cost accepted.** An upstream's name is part of its public URL, so renaming one is a client-visible
+change. And two upstreams cannot share a first segment. Both are accepted for the log-readability
+property. Note that two upstreams *may* share a `base_url`, and deliberately so — a fast read path and a
+slow report path on one deployment get separate names, and therefore separate breakers and separate
+bulkheads, which is the whole point of per-dependency isolation.
+
+---
+
+## ADR-048 — `/healthz` reports liveness only, and says nothing about the dependencies
+
+**Status:** accepted (slice 4)
+
+**Context.** A health endpoint that checks its dependencies is a common and intuitive pattern: it means an
+orchestrator only sends traffic to an instance that can actually serve it.
+
+**Decision.** `/healthz` answers one question — can this process accept and route a request — and returns
+`{"status": "ok"}` while every circuit in the gateway is open. Dependency state is published separately at
+`/resilience`.
+
+**Why.** This is the most important small decision in `app.py`. A health check that reports unhealthy
+during a dependency outage tells the orchestrator to restart or remove this instance — destroying the
+capacity that was about to serve degraded traffic, at the exact moment it is needed, and doing it to every
+replica simultaneously because they all observe the same outage. The result is a total outage caused by the
+health check, and the incident timeline shows the platform doing it to itself.
+
+A gateway whose circuit is open is *working*. It is shedding load on purpose, quickly, which is the
+behaviour three slices of this project exist to produce. Reporting that as ill health throws it away.
+
+So dependency state goes somewhere a human or a dashboard reads it and nothing automatically kills
+anything. The separation is the point: liveness is for machines with the power to terminate, and
+`/resilience` is for people deciding what to do.
+
+**Cost accepted.** An operator who assumes `/healthz` is end-to-end will believe the system is fine when
+its dependencies are not. The endpoint's own docstring and the README both say what it does and does not
+cover, and `/resilience` exists so the other question has an answer.
+
+---
+
+## ADR-049 — `/resilience` is unauthenticated, and that is recorded as a limitation rather than fixed
+
+**Status:** accepted (slice 4)
+
+**Context.** `/resilience` publishes every breaker's state and every bulkhead's counters: concurrency
+limits, queue depths, current saturation, peaks.
+
+**Decision.** Expose it unauthenticated, and state the exposure in the endpoint's docstring, in this ADR
+and in the README's limitations section.
+
+**Why.** The exposure is real — it describes our capacity and how close to the limit we are, which is
+reconnaissance for anyone planning to overload us — and in a real deployment this belongs on an admin port
+or behind authentication. It is unauthenticated here because this repository is a demonstration of three
+resilience patterns, and an auth scheme is a second, unrelated project whose presence would suggest more
+than it delivered. A token check bolted on for appearance's sake is worse than an honest note: it looks
+like a security boundary to a reader skimming the code, and it is one HTTP header away from being none.
+
+Two counters in the payload are worth publishing precisely because they should be zero forever:
+`unresolved_permits` and `trips`. A non-zero `unresolved_permits` is a bug in this project rather than a
+problem with a dependency, and a dashboard is where somebody will notice. Hiding a counter because it
+should be zero is how a counter designed to be alerted on ends up read by nobody.
+
+**Cost accepted.** Anyone who can reach the port can read our capacity. Documented, deliberate, and not
+something to run on a public interface.
+
+**Implementation note.** The breaker payload's keys are written out by hand rather than derived with
+`dataclasses.asdict`: the state is an `Enum` and would not serialise, and — more to the point — these key
+names are a contract that something is graphing. Deriving them from field names means a rename inside the
+breaker silently breaks a dashboard, in a change that looks purely internal. The bulkhead snapshot *is* run
+through `asdict`, because every field is already a number named for exactly this purpose and duplicating
+fourteen of them here would guarantee one gets missed when a fifteenth is added.
+
+---
+
+## ADR-050 — No retries, anywhere
+
+**Status:** accepted (slice 4)
+
+**Context.** Retries are the fourth pattern anybody expects next to timeouts, breakers and bulkheads, and
+they are conspicuous by their absence.
+
+**Decision.** None. Absent on purpose rather than unfinished, and listed in the README as not built.
+
+**Why.** A retry *inside* the guarded call is actively harmful. It would spend one deadline on two attempts
+while holding one bulkhead slot for both, so the second attempt runs with whatever the first one left —
+usually not enough, which makes it a call that exists only to fail, having made the dependency do the work
+anyway. It would also feed two outcomes into the breaker for one client request, doubling a failing
+dependency's weight in its own window and making the failure rate mean something other than what its name
+says. And retrying into a dependency that is already struggling is the retry storm that a breaker is
+installed to stop.
+
+Where a retry belongs is *outside* the breaker: attempt, and if the breaker rejects or the call fails,
+decide at that level whether a second attempt is affordable within the remaining budget — with the budget's
+own arithmetic deciding, not a fixed count. That is a real feature and it is not built here.
+
+**Cost accepted.** A single transient blip that a retry would have hidden reaches the client. That is the
+honest behaviour for a gateway with a deadline: the client holds the budget and is the party entitled to
+decide whether to spend what is left of it on another attempt.
+
+---
+
+## ADR-051 — Configuration is a frozen dataclass validated in `__post_init__`, not at first use
+
+**Status:** accepted (slice 4)
+
+**Context.** The gateway needs a description of what it fronts. The usual shapes are a dict parsed from
+YAML, environment variables, or a settings library.
+
+**Decision.** Frozen `@dataclass(slots=True)` objects — `UpstreamConfig` and `GatewayConfig` — with every
+rule checked in `__post_init__`, and the routing index built there too. No defaults for any policy number.
+
+**Why.** Three failure modes, each addressed by one part of that choice.
+
+A typo in a key. In a dict, `max_queue` misspelt as `max_quue` is silently ignored and the queue takes
+whatever default the code supplies — a value nobody chose, discovered during an incident. In a dataclass it
+is a `TypeError` before the process accepts a request.
+
+Drift at runtime. Frozen, so a request handler cannot retune a threshold mid-flight. A breaker whose
+threshold changed halfway through its window is a breaker whose window means nothing, and the resulting
+report — "it opened at 40% once" — is unreproducible, so nobody can confirm a fix.
+
+Late validation. A gateway that starts happily and then behaves strangely for one upstream sends an
+investigation to the dependency, where there is nothing to find. Checking at construction turns that into a
+line naming the field, and under a rolling deployment it is strictly better still: the new pods fail their
+health checks and the rollout stops with the old version serving.
+
+No defaults for the policy numbers, for the reason ADR-007 and ADR-023 give one level down. A default here
+would be a number applying to every dependency the gateway fronts, and no such number exists — a payments
+provider and a recommendations service differ by an order of magnitude in all of them. The two values that
+*are* permissive are permissive deliberately: `max_queue=0` is a real policy (shed on arrival, which is
+strictly better when queueing only adds wait to calls that will be refused anyway), and
+`minimum_call_ms=0` is a documented footgun rather than an impossibility, because validation's job is to
+reject the impossible and not to enforce taste.
+
+**Cost accepted.** Configuration is Python, so deploying a change means shipping code rather than editing a
+file. For this project that is a feature — the config is type-checked by mypy and every invalid combination
+is a test — and a loader that parses YAML into these same objects can be added later without touching a
+validation rule.
+
+---
+
+## ADR-052 — The proxied method list is explicit, and excludes CONNECT and TRACE
+
+**Status:** accepted (slice 4)
+
+**Context.** Starlette's `api_route` takes a list of methods. The convenient thing is to list all of them,
+or to accept anything.
+
+**Decision.** `["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]`, written out.
+
+**Why.** The two absent methods are absent for different reasons and neither should be acquired by
+accident. CONNECT asks a proxy to open a tunnel: that is a different piece of software with a different
+threat model, and supporting it by omission would mean supporting it without having thought about it. TRACE
+echoes the request back, which can be used to read headers a client cannot otherwise see, and it is
+switched off on anything public for that reason.
+
+**Cost accepted.** A dependency using a genuinely unusual method — WebDAV's `PROPFIND`, say — needs an edit
+here. That is one line, and it comes with a moment's thought about what the method does, which is the
+outcome this list is for.
+
+---
+
+## ADR-053 — Header bytes are moved with `latin-1`
+
+**Status:** accepted (slice 4)
+
+**Context.** ASGI and httpx both expose header names and values as raw bytes. The filtering in `headers.py`
+works on text, so something has to decode and re-encode them.
+
+**Decision.** `latin-1` in both directions.
+
+**Why.** It is a lossless round trip for every possible byte sequence, because `latin-1` maps bytes 0-255
+onto code points 0-255 and back with no gaps. `utf-8` would raise on a header a misbehaving peer sent as
+arbitrary bytes, converting their protocol violation into a 500 from us — a gateway crashing because
+somebody else sent something odd is the failure mode this whole project is about. `errors="replace"` would
+silently corrupt the value instead, which is worse: the request succeeds and the header is subtly wrong.
+
+**Cost accepted.** The decoded strings are not meaningful text for non-ASCII bytes, and must not be treated
+as though they were. Nothing in this project does — the only operations performed on them are `lower()`,
+comparison against ASCII field names, and `split(",")` — and the encode back to `latin-1` happens before
+anything reaches a socket.

@@ -4,11 +4,23 @@ version = "0.1.0"
 description = "A resilience-aware edge gateway: timeout budgets, circuit breaking and bulkheads."
 requires-python = ">=3.12"
 
-# The RESILIENCE CORE has no runtime dependencies, deliberately — see DECISIONS.md ADR-002.
-# `fastapi`/`httpx`/`uvicorn` arrive in slice 4 when there is actually an HTTP surface to serve;
-# declaring them now would be declaring a dependency nothing imports, which is how a dependency
-# list stops being a description of the software and becomes folklore.
-dependencies = []
+# The RESILIENCE CORE still has no runtime dependencies — see DECISIONS.md ADR-002. Nothing under
+# `edge_gateway/resilience/` imports anything below, and that is enforced by a test rather than by
+# good intentions (`test_layering.py`). What follows is what the HTTP SURFACE under
+# `edge_gateway/gateway/` needs, which arrived with slice 4 because that is when there was actually
+# something to serve. Declaring them earlier would have been declaring dependencies nothing imported,
+# which is how a dependency list stops describing the software and becomes folklore.
+dependencies = [
+    # The ASGI framework. Used for routing, dependency wiring and the lifespan hook that closes the
+    # HTTP clients; deliberately NOT for validation, since a proxy must forward bodies it does not
+    # understand.
+    "fastapi~=0.141",
+    # The outbound HTTP client. Chosen over `aiohttp` for one specific reason: pluggable transports.
+    # `httpx.MockTransport` lets every test in `test_gateway.py` exercise the real client, the real
+    # connection-pool limits and the real request construction with no socket and no server — so the
+    # tests are fast and hermetic without the code under test being a stub of itself.
+    "httpx~=0.28",
+]
 
 [project.optional-dependencies]
 dev = [
@@ -17,6 +29,11 @@ dev = [
     "ruff~=0.16",
     "mypy~=2.3",
 ]
+# `uvicorn` is a *serving* dependency, not an importing one: `create_app` returns an ASGI
+# application and nothing in this package needs a server to be tested. Kept out of `dependencies`
+# so that using this gateway as a library — mounting the app inside a larger one — does not drag in
+# a server the host does not want.
+serve = ["uvicorn~=0.46"]
 
 [build-system]
 requires = ["setuptools>=77"]

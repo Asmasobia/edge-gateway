@@ -15,33 +15,50 @@ must not count as a dependency failure. A `timeout: 1s` line in a YAML file demo
 
 ## Status
 
-**Slices 1–3 of 4 complete: timeout budgets, circuit breaking and bulkheads.** The remaining slice is
-the HTTP surface that composes all three.
+**All four slices complete: timeout budgets, circuit breaking, bulkheads, and the HTTP surface that
+composes them.**
 
 | | Slice | State |
 |---|---|---|
 | 1 | Deadlines / timeout-budget propagation | ✅ done — 42 tests, 10/10 mutants killed |
 | 2 | Circuit breaker (sliding window, half-open with bounded trials) | ✅ done — 68 tests, 20/20 mutants killed |
 | 3 | Bulkhead (bounded concurrency + bounded queue) | ✅ done — 32 tests, 22/22 mutants killed |
-| 4 | Composition + HTTP proxy, failure classification | ⬜ not started |
+| 4 | Composition + HTTP proxy, failure classification | ✅ done — 192 tests, 51/52 mutants killed |
+
+The one surviving mutant is documented rather than hidden: see [ADR-039](DECISIONS.md) and the note
+under the slice 4 table in [Verification](#verification).
 
 ## Quick start
 
-Requires Python 3.12+. The resilience core itself has no runtime dependencies — no service to start
-and no network access needed — so the only install is the test and lint toolchain.
+Requires Python 3.12+. The `resilience/` package still has no runtime dependencies of its own — it is
+importable and testable with nothing installed but the toolchain — and the HTTP surface in `gateway/`
+adds FastAPI and `httpx`.
 
 ```bash
 git clone <this repo> && cd edge-gateway
-python -m pip install -e ".[dev]"      # pytest, pytest-asyncio, ruff, mypy
-python -m pytest                       # 142 tests, ~0.3s — none of them sleep
+python -m pip install -e ".[dev]"      # fastapi, httpx + pytest, pytest-asyncio, ruff, mypy
+python -m pytest                       # 334 tests, ~2s — none of them sleep
 python -m ruff check . && python -m ruff format --check .
 python -m mypy --strict src tests
 ```
 
+To actually serve traffic, install the extra that adds the server and point it at a config:
+
+```bash
+python -m pip install -e ".[dev,serve]"     # adds uvicorn
+python -m uvicorn --factory your_module:build_gateway --port 8000
+```
+
+There is deliberately no `main.py` and no bundled config: every number in `GatewayConfig` is a policy
+decision about a specific dependency, and shipping a plausible-looking default set is how somebody
+ends up running production on numbers this repository invented (ADR-051). `create_app(config)` is the
+entry point, and `tests/test_gateway.py` shows it wired up.
+
 `pytest-asyncio` is needed from slice 3 onward: the bulkhead is the first component that can wait, so
 the suite has async tests, and `pyproject.toml` sets `asyncio_mode = "strict"` (see ADR-034 for why
 `strict` and not `auto`). The project itself is still never *built* to run the tests — `pythonpath`
-points at `src/`, so the editable install above is for the tools, not to make imports work.
+points at `src/`, so the editable install above is for the tools and the runtime libraries, not to
+make imports work.
 
 ## The idea: budgets, not timeouts
 
@@ -316,13 +333,158 @@ ghost either. There is a test for precisely that.
 - **Not thread-safe, deliberately** — same reasoning as the breaker. Every mutation is straight-line with
   no `await` between reading and writing state, which is a property to preserve when editing it.
 
+## The idea: the composition is where the bugs are
+
+Three protections that each work in isolation still have to be arranged, and this is the part that is
+easy to get wrong *and* hard to notice: **most of the wrong arrangements pass every test written per
+component.** They return the right status codes, they refuse the right requests, and they cost
+something on every request during an outage.
+
+`Guard.call` fixes one order:
+
+```
+1. deadline viability   is this call worth making at all?      (one subtraction, acquires nothing)
+2. circuit breaker      is the dependency worth calling?       (an integer comparison, cannot block)
+3. bulkhead slot        do we have capacity to spare on it?    (the scarcest resource, so: last)
+4. deadline viability   is it STILL worth making?              (queueing spent real budget)
+5. the call             bounded by whatever budget remains, minus the reserve
+```
+
+The rule generating it is that the cheapest refusal comes first, and nothing is acquired before
+something that could have refused without it. Invert steps 2 and 3 — the most natural-looking mistake,
+since "get a slot, then check" reads fine — and a caller waits in the queue for its entire budget
+before discovering the circuit was open the whole time, having occupied a queue position that a viable
+request could have used. Nothing errors. The only symptom is latency during an outage, which is the
+last place anybody looks for a design bug.
+
+Step 4 is the one that gets left out. Queue wait is real elapsed time out of the request's budget, so a
+call that was viable when it joined the queue may have 4 ms left when it reaches the front — and issuing
+it then costs a connection, makes the dependency do work nobody will read, and records a timeout
+against *its* breaker. One comparison stands between a busy queue and a self-inflicted outage.
+
+The honest cost of this order is in [ADR-035](DECISIONS.md): because the breaker sits outside, its
+permit is held while we queue, and in HALF_OPEN that permit is one of a small number of probe slots. A
+queued request therefore occupies probe capacity without probing anything. That is accepted — the wait
+is bounded by the deadline, so it is self-limiting, whereas the alternative ordering pays its cost on
+every request in the far more common OPEN state.
+
+### Attribution: which failures are the dependency's fault
+
+There are eight ways out of `Guard.call`. One of them is a real answer, and it defers to `classify`. Of
+the remaining seven — every one of which is a failure of some kind — exactly **two** are evidence about
+the dependency, and the other five are evidence about us:
+
+| Way out | Recorded as | Why |
+|---|---|---|
+| The call returned | whatever `classify` says | 5xx is FAILURE, 4xx is not — see the table above |
+| We abandoned the call at our budget | `FAILURE` | It was called and did not answer. This is what a breaker is for |
+| The call raised (connection refused, TLS, DNS) | `FAILURE` | The dependency failed to serve us |
+| Budget too small on arrival | `NOT_COUNTED` | We never called it |
+| Budget ran out while queued | `NOT_COUNTED` | *Our* queue spent it |
+| Bulkhead full | `NOT_COUNTED` | Evidence about our saturation |
+| Slot wait expired | `NOT_COUNTED` | Same — and it moves `max_queue` the opposite way |
+| The client disconnected | `NOT_COUNTED` | Ambiguous, and the honest reading of ambiguity is "no evidence" |
+
+This is why there are **two separate `asyncio.timeout` scopes** rather than one around the whole thing.
+A single scope is simpler, produces correct total behaviour, and is unattributable: a timeout that fires
+while queueing and one that fires during the call are the same exception and mean opposite things.
+Collapse them and every period of *local* saturation records failures against a dependency that was
+healthy throughout — which trips its breaker, sheds traffic that had nothing to do with the saturation,
+and turns our capacity problem into their outage. That is the classification bug from the breaker
+section re-entering through the back door ([ADR-036](DECISIONS.md)).
+
+### The proxy part is not a one-line copy
+
+`outbound.headers = incoming.headers` is where every hand-rolled proxy starts, and it already contains
+all of these. Each one's symptom points somewhere other than the gateway:
+
+| Header | Handling | What forwarding it does |
+|---|---|---|
+| `connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`, `keep-alive`, `proxy-*` | dropped both ways | `Connection: close` tears down a pooled connection per request — the latency of having no pool, with a pool's memory cost and no error |
+| anything named *inside* `Connection` | dropped both ways | RFC 9110 §7.6.1 makes the set extensible per connection; ignoring it leaks a peer's connection-scoped header to an origin |
+| `host` | dropped outbound | It names *us*, so a virtual-hosted origin serves the wrong site — or somebody else's |
+| `content-length` | dropped both ways, recomputed | This hop buffers, so a stale value truncates the body or makes the peer wait for bytes that never come |
+| `content-encoding` | dropped inbound | `httpx` already decompressed the body; relaying `gzip` tells the client to inflate plaintext |
+| `x-timeout-budget-ms` | dropped outbound, re-added | Forwarding it verbatim un-spends the queue wait and our own work |
+
+Four more decisions in the same category, each with a test named after the bug rather than after the
+assertion:
+
+- **The outbound client keeps no cookies, and this was a real defect found by testing for it.**
+  `httpx.AsyncClient` is a *user agent*: it stores every `Set-Cookie` and replays it to the same host.
+  One shared client, therefore: caller A logs in, the dependency answers `Set-Cookie: session=…`, and
+  caller B — a different person holding no credentials — gets that cookie attached to their outbound
+  request and is authenticated as A. There is no bug anywhere in this project's own code; it is one
+  line of default behaviour in a well-behaved library. It is invisible from either caller's side, so
+  the test that found it asserts on what the **dependency** saw ([ADR-041](DECISIONS.md)).
+- **Redirects are returned, not followed.** A 301 is the answer the client asked for. Following it
+  spends one budget and one bulkhead slot on an unbounded chain and records only the last outcome, so a
+  dependency stuck in a redirect loop looks perfectly healthy while consuming everything.
+- **Repeated headers survive.** Response headers are assigned as raw pairs, never through a `Mapping`,
+  because `Set-Cookie` is repeated rather than comma-joined. A dict keeps the last one, and the symptom
+  — "login succeeds but the next request is unauthenticated" — points nowhere near a proxy.
+- **`httpx` is given no timeout of its own.** `timeout=None`, deliberately. Two timeouts for one call
+  are two deadlines with no relationship: whichever fires first decides the outcome, which one that is
+  depends on numbers in two files nobody reads together, and the one that loses is the request's actual
+  budget ([ADR-038](DECISIONS.md)).
+
+### What it refuses, and how it says so
+
+Five distinct refusals collapse onto two status codes, which is correct — a client only needs "retry
+later" or "the deadline passed", and private status codes would break every intermediary that
+understands the standard ones. But the five have five different *fixes*, so the reason travels in
+`x-gateway-refusal`:
+
+| Situation | Status | `x-gateway-refusal` | What to do about it |
+|---|---|---|---|
+| Budget too small on arrival | 504 | `budget-exhausted-on-arrival` | Talk to the caller, or find the hop eating the budget |
+| Budget spent in our queue | 504 | `budget-exhausted-while-queued` | Lower `max_queue` |
+| Circuit open | 503 + `Retry-After` | `circuit-open` | Go and look at the dependency |
+| Bulkhead full | 503, no `Retry-After` | `bulkhead-full` | Raise `max_concurrent`, or shed sooner |
+| Slot wait expired | 504 | `slot-wait-expired` | The queue is too *deep* for the budget |
+| Dependency did not answer | 504 | `upstream-timeout` | The dependency |
+| No such upstream | 404 | `unknown-upstream` | The client's URL, or our config |
+
+Three details in that table are decisions rather than mechanics. A full bulkhead is **503 and never
+429**: Too Many Requests says *you* sent too many, and a caller refused because two hundred other
+callers are in flight has been told something false — which it acts on, because well-written clients
+back off harder on 429. `Retry-After` appears **only where a number can be justified**, which is an open
+circuit whose cooldown the breaker scheduled itself; inventing one for saturation would synchronise
+every refused client onto the same instant and produce a thundering herd we caused ourselves. And the
+exception's own message is **never** in the response body: `BulkheadFullError`'s message carries our
+in-flight count, queue depth and queue capacity, which is a free readout of how much load we can absorb
+and how close to the limit we are right now.
+
+**Nothing above is a 500, and nothing unrecognised is dressed up as a 502.** `refusal_for` returns
+`None` for an exception it does not know, the handler re-raises, and a traceback naming our own file
+lands in the log. A tidy catch-all 502 would file our own `KeyError` under "the dependency is flaky",
+and it would stay there, because a 502 from a gateway means "upstream is broken" to everyone who reads
+one ([ADR-045](DECISIONS.md)).
+
+### Two operational endpoints, and why they are two
+
+`GET /healthz` answers exactly one question — can this process accept and route a request — and it
+returns 200 **while every circuit in the gateway is open**. That looks wrong and is the most important
+small decision in `app.py`. A health check that reports unhealthy during a dependency outage tells the
+orchestrator to restart or remove this instance, destroying the capacity that was about to serve
+degraded traffic, at the moment it is needed, and doing it to every replica at once because they all see
+the same outage. A gateway whose circuit is open is *working*: it is shedding load on purpose.
+
+`GET /resilience` publishes every breaker and bulkhead snapshot for dashboards and incident response —
+including `unresolved_permits` and `trips`, which are meant to be zero forever and are therefore the
+two cleanest things here to alert on. Nothing automatically kills anything based on it. It is
+unauthenticated, which is a stated limitation below rather than an oversight.
+
 ## Verification
 
 Claims here are limited to what was actually run on the development machine.
 
-**Verified:** 142 unit tests passing in ~0.3 s; `ruff check` and `ruff format --check` clean;
-`mypy --strict` clean across 11 files; and all three slices mutation-tested, with **every** reintroduced
-defect caught.
+**Verified:** 334 unit tests passing in ~2 s; `ruff check` and `ruff format --check` clean;
+`mypy --strict` clean across all 26 modules — 15 under `src/` and the 11 test modules too, because a
+test that type-checks is a test whose fixtures cannot silently drift from the code they exercise; all
+four slices mutation-tested, with 103 of 104 reintroduced defects caught and the one survivor described
+below; and one end-to-end run over a real TCP socket, through uvicorn, to a real HTTP dependency (see
+[Beyond the unit tests](#beyond-the-unit-tests)).
 
 Slice 1 — timeout budgets, 10 mutants, 10 caught:
 
@@ -397,12 +559,140 @@ distinctly for that reason.
 | `max_concurrent` validation removed | `test_construction_rejects_impossible_limits` |
 | `max_queue` validation removed | `test_construction_rejects_impossible_limits` |
 
-**Not verified, and not claimed:** there is no HTTP surface yet, so nothing here has served a real
-request; no load test, no cluster, no cross-host clock-skew experiment. The bulkhead tests do run many
-tasks concurrently on a real event loop, including cancellation storms — but they run no I/O and no
-threads, so the "not thread-safe, single event loop" claim remains an argument about the code rather
-than a measurement, and so do the sizing formulas above, which are arithmetic and not benchmarks. Those
-belong to slice 4 and to the sibling reliability project.
+Slice 4 — the composition and the HTTP surface, 52 mutants, **51 caught and one deliberate survivor**.
+This is the slice where mutation testing earns its keep, because the defects it reintroduces are not
+off-by-ones in arithmetic that a careful reader would spot: they are plausible, shippable readings of the
+same requirement. "A full bulkhead is a failure" is what most implementations do. `follow_redirects=True`
+is what the `httpx` documentation shows. `timeout=5.0` on the client looks like defensive programming.
+Every row below is a version of this gateway that somebody could review and approve.
+
+First `guard.py`, where the composition lives, and where nearly every mutation is about **attribution**
+rather than behaviour — the code still refuses and still forwards, it just records the wrong verdict
+about whose fault the refusal was, and that error is invisible until a breaker trips on the strength of
+our own saturation:
+
+| Mutant | Caught by |
+|---|---|
+| The viability check on arrival is skipped | `test_a_budget_too_small_to_be_worth_spending_is_refused_before_the_call` |
+| The viability re-check after queueing is skipped | `test_the_budget_can_run_out_while_queueing_and_that_is_reported_separately` |
+| The `queued` flag on an exhausted budget is inverted (the two 504s swap names) | `test_a_budget_too_small_to_be_worth_spending_is_refused_before_the_call` |
+| A full bulkhead recorded as evidence against the dependency | `test_a_full_bulkhead_is_never_evidence_against_the_dependency` |
+| An expired slot wait recorded as evidence against the dependency | `test_waiting_for_a_slot_stops_at_the_budget_and_is_not_evidence` |
+| An expired slot wait surfaces as a bare `TimeoutError` | `test_waiting_for_a_slot_stops_at_the_budget_and_is_not_evidence` |
+| A cancellation while queued recorded as evidence | `test_a_cancellation_while_queueing_is_not_evidence_either` |
+| Our own upstream timeout *not* counted | `test_a_timeout_during_the_call_is_the_one_timeout_that_counts` |
+| A `TimeoutError` the operation raised itself relabelled as ours | `test_a_timeout_the_operation_raised_itself_is_not_relabelled_as_ours` |
+| A cancellation during the call recorded as evidence | `test_a_cancellation_during_the_call_is_not_evidence` |
+| An exception from the operation not counted | `test_an_exception_from_the_operation_counts_and_propagates` |
+| The classifier's verdict ignored — everything is a success | `test_an_open_circuit_refuses_with_a_503_and_a_retry_time` |
+| The reserve not withheld from our own patience | `test_the_reserve_also_shortens_the_timeout_the_call_is_given` |
+| Negative `reserve_ms` accepted | `test_construction_rejects_negative_millisecond_values` |
+| Negative `minimum_call_ms` accepted | `test_construction_rejects_negative_millisecond_values` |
+
+Then the two modules that decide what a response *means* and which bytes are allowed to cross the hop:
+
+| Mutant | Caught by |
+|---|---|
+| A 4xx counted as a dependency failure | `test_client_errors_are_not_evidence[400]` |
+| A 5xx not counted at all | `test_server_errors_are_failures[500]` |
+| Hop-by-hop headers forwarded | `test_a_hop_by_hop_header_from_the_dependency_is_not_relayed` |
+| The `Connection` header's contents ignored | `test_a_header_named_in_connection_is_also_dropped` |
+| The direction-specific drops ignored | `test_the_host_header_names_the_dependency_and_not_the_gateway` |
+| Header matching made case-sensitive | `test_content_length_matches_the_body_we_actually_send` |
+| The client's budget header forwarded verbatim | `test_the_budget_sent_downstream_is_recomputed_and_not_the_one_we_received` |
+| Our `Host` header forwarded to the dependency | `test_the_host_header_names_the_dependency_and_not_the_gateway` |
+| `content-encoding` relayed beside a body `httpx` already decompressed | `test_content_encoding_is_dropped_inbound_but_kept_outbound` |
+
+Then the refusal table and the outbound client — the client row that survived is discussed below:
+
+| Mutant | Caught by |
+|---|---|
+| The timeout branch removed, so every timeout becomes a 502 | `test_a_timeout_from_httpx_is_matched_before_the_general_transport_error` |
+| A full bulkhead blames the client with a 429 | `test_a_full_bulkhead_is_a_503_and_never_a_429` |
+| An unrecognised exception dressed up as a 502 | `test_an_unrecognised_exception_is_not_dressed_up_as_a_refusal[KeyError]` |
+| `Retry-After` rounds down, so a sub-second cooldown becomes `0` | `test_retry_after_rounds_up_and_never_falls_below_one_second[0.0-1]` |
+| The exception's own message sent to the client | `test_the_exception_message_never_reaches_the_client` |
+| The cookie jar remembers again (the cross-caller leak) | `test_one_callers_cookies_are_never_attached_to_another_callers_request` |
+| Redirects followed on the caller's behalf | `test_a_redirect_is_handed_back_to_the_caller_rather_than_followed` |
+| `httpx` applies its own timeout alongside the guard's | `test_the_outbound_client_applies_no_timeout_of_its_own` |
+| The outbound budget not reduced by the reserve | `test_the_budget_sent_downstream_is_recomputed_and_not_the_one_we_received` |
+| The query string dropped | `test_the_query_string_is_passed_through_byte_for_byte` |
+| Every response classified as a success | `test_an_open_circuit_refuses_with_a_503_and_a_retry_time` |
+| **The connection pool sized smaller than the bulkhead** | **nothing — see below** |
+
+And the wiring and the startup validation. The `config.py` rows are the cheapest mutations in the whole
+matrix — each one deletes a single `if` from a `__post_init__` — and they are worth running precisely
+because validation is the code most likely to be quietly weakened during a refactor:
+
+| Mutant | Caught by |
+|---|---|
+| The request body not forwarded | `test_a_request_body_is_forwarded_unchanged` |
+| Request headers forwarded unfiltered | `test_the_host_header_names_the_dependency_and_not_the_gateway` |
+| Response headers collapsed into a dict (repeated `Set-Cookie` lost) | `test_repeated_set_cookie_headers_all_survive` |
+| `Content-Length` off by one | `test_content_length_matches_the_body_we_actually_send` |
+| A 204 given a `Content-Length` | `test_a_204_carries_no_content_length_at_all` |
+| An unknown upstream reported as a dependency failure (502) | `test_an_unknown_upstream_is_a_404_that_says_it_was_ours` |
+| Every refusal becomes a 500 | `test_a_budget_too_small_to_be_worth_spending_is_refused_before_the_call` |
+| Routing ignores the path and always picks the first upstream | `test_an_unknown_upstream_is_a_404_that_says_it_was_ours` |
+| The ceiling used as the default budget | `test_a_request_with_no_budget_header_is_given_the_configured_default` |
+| The connection pools never closed on shutdown | `test_the_lifespan_closes_the_connection_pools_on_shutdown` |
+| A reserved upstream name accepted | `test_a_name_that_shadows_an_operational_endpoint_is_rejected[healthz]` |
+| A name containing a slash accepted | `test_a_name_containing_a_slash_is_rejected` |
+| A schemeless `base_url` accepted | `test_a_base_url_without_an_http_scheme_is_rejected[search.internal]` |
+| `max_concurrent` of zero accepted | `test_a_max_concurrent_of_zero_is_rejected` |
+| A ceiling below the default budget accepted | `test_a_ceiling_below_the_default_is_rejected` |
+| Duplicate upstream names accepted | `test_two_upstreams_with_the_same_name_are_rejected` |
+
+#### The survivor, and why it is still in the matrix
+
+Setting `max_connections=1` on the outbound client, while the bulkhead still admits four concurrent
+calls, changes nothing that any of the 334 tests can see. The reason is structural rather than an
+oversight in the assertions: every test injects an `httpx.MockTransport`, and a mock transport has no
+connection pool for the limits to reach. Nothing observable is downstream of that constructor argument.
+
+Asserting it would mean reaching into `client._transport._pool._max_connections` — a triple-underscore
+path into `httpx` internals that would break on a patch release and would be testing `httpx` rather than
+this code — or standing up a real server and measuring concurrency, which is a load test rather than a
+unit test. Both were rejected; the invariant is recorded in [ADR-039](DECISIONS.md) instead, with the
+sizing argument written out (a pool smaller than the bulkhead reintroduces exactly the queueing the
+bulkhead exists to make explicit, but *inside* `httpx`, where no metric and no `Retry-After` can see it).
+
+The mutation stays in the matrix anyway. Deleting it would take the headline from 51/52 to 51/51, and
+would delete the only executable record that the gap exists — which is the opposite of what a mutation
+matrix is for. A known survivor with a written reason is a better artefact than a clean score.
+
+### Beyond the unit tests
+
+Everything in `tests/` runs the app through `httpx.ASGITransport` and answers the outbound call from an
+`httpx.MockTransport`. That exercises real routing, real raw ASGI header bytes, the real `httpx` client
+and the real request construction — everything except a socket, which is what makes 334 tests finish in
+about two seconds with no ports, no fixtures and no flakiness.
+
+It also leaves one honest gap, so it was closed separately: a throwaway script started **two real
+uvicorn servers** on loopback — the gateway, and an "echo" dependency that returns as JSON exactly what
+it received — and made real HTTP requests to the gateway. Eighteen checks, all passing, and four of them
+are things no in-process test can see because they require the request to actually cross a wire:
+
+```
+ok  the budget crossed the wire, reduced by the reserve   (x-timeout-budget-ms: 1000 in -> 980 out)
+ok  Host names the dependency, not the gateway
+ok  a header named in Connection did not survive the hop
+ok  no permit was left unresolved, and no slot was leaked  (read back from /resilience)
+```
+
+The rest cover the path-segment strip, the query string surviving byte for byte, a POST body arriving
+intact, an unknown upstream as a labelled 404, and a 10 ms budget being refused as
+`budget-exhausted-on-arrival` before any call is made. The script is not in the repository: it is a
+measurement taken once, not a test to be maintained, and a suite that needs two servers and a free port
+is a suite that starts being skipped.
+
+**Not verified, and not claimed:** no load test, no cluster, no cross-host clock-skew experiment, and no
+sustained-traffic run of any kind — so every sizing formula above is arithmetic rather than a benchmark.
+The bulkhead tests do run many tasks concurrently on a real event loop, including cancellation storms,
+but they run no I/O and no threads, so the "not thread-safe, single event loop" claim remains an argument
+about the code rather than a measurement. Nothing here has run under a real client population, behind a
+real load balancer, or for longer than a few seconds at a time. Those belong to the sibling reliability
+project.
 
 ### A bug this found
 
@@ -469,6 +759,40 @@ The general lesson, restated because slice 3 found it independently: a test that
 can still be blind to the defect, either because the configuration avoids the path or because the fixture
 values make two implementations agree. Neither is visible on the page.
 
+## Limitations
+
+Deliberate, and each one is a decision with an ADR behind it rather than an omission:
+
+- **Bodies are buffered, not streamed** (ADR-044). Both directions are read fully into memory before
+  being passed on, which is what makes `Content-Length` correct and the deadline enforceable — and what
+  makes this unsuitable for file transfer, for server-sent events, and for anything whose whole point is
+  that the first byte arrives before the last one. Worth being precise about the memory: the request body
+  is read *before* the guard is entered, so the ceiling is not `max_concurrent × body` but the number of
+  connections uvicorn is willing to accept multiplied by the largest body — the bulkhead does not bound it,
+  and nothing here enforces a maximum body size. Put a limit in front of it.
+- **No retries, anywhere** (ADR-050). A failed call fails. Retrying is a decision that needs to know
+  whether the operation is idempotent, and the gateway does not and cannot know that; a retry layer here
+  would also multiply load on a dependency that is already the reason the breaker exists. That belongs to
+  the caller, which knows what it asked for.
+- **`/resilience` is unauthenticated** (ADR-049). It exposes failure rates, queue depths and breaker
+  states — operationally useful, and useful to an attacker probing which dependency to push over. In a
+  real deployment it belongs on a separate port bound to an internal interface, or behind the same auth
+  as everything else. Recorded as a limitation rather than half-fixed.
+- **The header filter is not a security boundary.** It is a deny list of hop-by-hop names plus whatever
+  the peer put in `Connection` (ADR-043), which is correct for protocol hygiene and *not* a defence: an
+  allow list is what you want if the threat model includes a caller smuggling headers your origin trusts.
+  Nor is anything here an authentication or authorisation layer — the gateway forwards `Authorization`
+  untouched and forms no opinion about it.
+- **`CONNECT` and `TRACE` are not proxied** (ADR-052) — the method list is written out rather than
+  wildcarded, so neither can be acquired by accident. **WebSockets are not proxied either**, and that one
+  has no ADR because it is not a decision so much as a different problem: an upgrade has no
+  request/response pair, so there is no budget to spend, nothing for a bulkhead slot to bound for a
+  bounded time, and no status code to classify.
+- **Single process, single event loop.** Nothing here is thread-safe by design, and the state is
+  per-process — so with *n* replicas behind a load balancer, each breaker forms its own opinion from its
+  own share of the traffic and each bulkhead bounds only its own concurrency. Effective limits are
+  per-replica, and must be sized that way.
+
 ## Layout
 
 ```
@@ -479,15 +803,35 @@ src/edge_gateway/
     window.py          bounded-memory sliding window of successes and failures
     breaker.py         the circuit breaker and its permits
     bulkhead.py        bounded concurrency with a bounded queue
+    classify.py        which answers are evidence about a dependency's health
+    guard.py           the composition: deadline + breaker + bulkhead, in one fixed order
+  gateway/             the HTTP surface — FastAPI and httpx live only in here
+    config.py          frozen configuration, validated at construction
+    headers.py         per-direction header filtering, including Connection's contents
+    errors.py          the refusal table: which exception becomes which status
+    upstream.py        one guarded dependency and its outbound client
+    app.py             routing, the proxy handler, and the operational endpoints
 tests/
   test_deadline.py     42 tests
   test_window.py       22 tests
   test_breaker.py      46 tests
   test_bulkhead.py     32 tests
-DECISIONS.md           architecture decision records (ADR-001 … ADR-034)
+  test_classify.py     37 tests
+  test_guard.py        21 tests
+  test_config.py       32 tests
+  test_headers.py      21 tests
+  test_errors.py       26 tests
+  test_gateway.py      39 tests   end-to-end through ASGI, upstream mocked at the transport
+  test_layering.py     16 tests   asserts resilience/ imports nothing from gateway/
+DECISIONS.md           architecture decision records (ADR-001 … ADR-053)
 ```
 
-None of the 142 tests sleep. The async ones drive concurrency with `create_task` plus `await
+The layering is enforced rather than intended: `test_layering.py` walks the AST of every module under
+`resilience/` and fails if one of them imports `fastapi`, `httpx`, or anything from `gateway/`. That is
+what keeps the patterns reusable — they can be lifted into a worker, a CLI or a message consumer, none of
+which has an HTTP request to hang a deadline on.
+
+None of the 334 tests sleep. The async ones drive concurrency with `create_task` plus `await
 asyncio.sleep(0)` — a yield to the scheduler, not a wait — and provoke abandonment with `task.cancel()`
 directly instead of with a timer, which is both faster and far more precise than hoping a timeout lands
 in the right window.

@@ -326,6 +326,18 @@ class Permit:
         tells you whether a dependency is recovering or merely up."""
         return self._is_trial
 
+    def resolve(self, outcome: Outcome) -> None:
+        """Record an outcome that was computed rather than chosen.
+
+        Added in slice 4. The three named methods below are the right shape at a call site that
+        *knows* what happened — `permit.success()` reads better than `permit.resolve(SUCCESS)`. But
+        the composition layer does not know: it holds an `Outcome` value returned by a
+        classification function (see `classify.py`), and forcing a value back through a three-way
+        `if` to pick a method is a translation that can only introduce mistakes. Both spellings
+        exist because both call sites are real.
+        """
+        self._resolve(outcome)
+
     def success(self) -> None:
         self._resolve(Outcome.SUCCESS)
 
